@@ -1,0 +1,13 @@
+name = "url-shortener"
+main = "worker/index.js"
+compatibility_date = "2024-10-01"
+
+# Static frontend (built by Vite into ./dist) is served first;
+# anything that doesn't match a file falls through to the Worker below,
+# which handles /api/* and the /:code redirect.
+assets = { directory = "./dist", binding = "ASSETS" }
+
+[[d1_databases]]
+binding = "DB"
+database_name = "url_shortener"
+database_id = "c6b8c1cb-3835-4352-984c-408c79ee816b"
