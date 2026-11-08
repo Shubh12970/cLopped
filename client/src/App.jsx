@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from "react";
+import QRCode from "qrcode";
 
 const shortHref = (code) => `${window.location.origin}/${code}`;
 
@@ -31,6 +32,7 @@ const loadCodes = () => {
 function ShortenForm({ onCreated }) {
   const [url, setUrl] = useState("");
   const [customCode, setCustomCode] = useState("");
+  const [expiresAt, setExpiresAt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [created, setCreated] = useState(null);
@@ -44,7 +46,11 @@ function ShortenForm({ onCreated }) {
       const res = await fetch("/api/links", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ url, custom_code: customCode || undefined }),
+        body: JSON.stringify({
+          url,
+          custom_code: customCode || undefined,
+          expires_at: expiresAt || undefined,
+        }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -82,6 +88,13 @@ function ShortenForm({ onCreated }) {
             pattern="[0-9A-Za-z_\-]{3,32}"
             title="3-32 characters: letters, numbers, - or _"
           />
+          <input
+            type="date"
+            value={expiresAt}
+            onChange={(e) => setExpiresAt(e.target.value)}
+            title="Optional expiry date"
+            min={new Date(Date.now() + 86400000).toISOString().slice(0, 10)}
+          />
           <button className="btn primary" type="submit" disabled={busy}>
             {busy ? "Shortening..." : "Shorten"}
           </button>
@@ -97,6 +110,28 @@ function ShortenForm({ onCreated }) {
         </div>
       )}
     </section>
+  );
+}
+
+function QrButton({ code }) {
+  const [src, setSrc] = useState(null);
+  return (
+    <>
+      <button
+        className="btn ghost"
+        onClick={async () => {
+          if (src) { setSrc(null); return; }
+          setSrc(await QRCode.toDataURL(shortHref(code), { margin: 1, width: 220 }));
+        }}
+      >
+        {src ? "Hide QR" : "QR"}
+      </button>
+      {src && (
+        <div className="qr">
+          <img src={src} alt={`QR code for ${shortHref(code)}`} />
+        </div>
+      )}
+    </>
   );
 }
 
@@ -120,6 +155,9 @@ function Stats({ code, onClose }) {
         <button className="btn ghost" onClick={onClose}>Close</button>
       </div>
       <p className="muted long-url">{stats.long_url}</p>
+      {stats.expires_at && (
+        <p className="muted">Expires {new Date(stats.expires_at).toLocaleString()}</p>
+      )}
       <p><strong>{stats.total_clicks}</strong> total clicks</p>
       {days.length > 0 ? (
         <div className="chart" title="Clicks per day">
@@ -208,6 +246,7 @@ export default function App() {
             <div className="row">
               <span className="badge">{l.clicks} clicks</span>
               <button className="btn ghost" onClick={() => setStatsFor(l.code)}>Stats</button>
+              <QrButton code={l.code} />
               <CopyButton text={shortHref(l.code)} />
             </div>
           </div>
@@ -215,7 +254,7 @@ export default function App() {
       </section>
 
       <footer className="muted">
-        302 redirects so every click stays countable. Sequential ids encoded in base62 - collision-free by construction.
+        302 redirects keep clicks countable - counts are approximate (bots and prefetching click too).
       </footer>
     </main>
   );

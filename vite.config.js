@@ -10,4 +10,8 @@ export default defineConfig({
     outDir: "../dist",
     emptyOutDir: true,
   },
+  test: {
+    root: ".",
+    include: ["tests/**/*.test.mjs"],
+  },
 });

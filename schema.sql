@@ -1,11 +1,12 @@
 -- URL shortener schema (Cloudflare D1 / SQLite)
 --
 -- links: one row per short link.
---   id        - database-generated sequential id; the short code is base62(id).
---   code      - the short code, unique. Auto codes are base62 of the row id;
---               custom codes are checked for conflicts before insert.
---   long_url  - the original URL (validated http/https, no private addresses).
---   created_at- ISO timestamp.
+--   id         - database-generated sequential id; the short code is base62(id).
+--   code       - the short code, unique. Auto codes are base62 of the row id;
+--                custom codes are checked for conflicts before insert.
+--   long_url   - the original URL (validated http/https, no private addresses).
+--   created_at - ISO timestamp (UTC).
+--   expires_at - optional ISO timestamp; expired links answer 410 Gone.
 --
 -- clicks: one row per redirect, so analytics can count per day and keep
 --         recent click details (referrer, coarse country from Cloudflare).
@@ -13,7 +14,8 @@ CREATE TABLE IF NOT EXISTS links (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   code TEXT NOT NULL UNIQUE,
   long_url TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  expires_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS clicks (
@@ -35,7 +37,7 @@ CREATE TABLE IF NOT EXISTS rate_limits (
   PRIMARY KEY (ip, window_start)
 );
 
--- Start auto ids at 3844 so the first generated code is "1Bc" (three chars),
--- matching the base62 example in the design notes. Codes stay >= 3 chars and
--- grow as rows are added; custom codes are checked against existing rows.
+-- Start auto ids at 3844 so the first generated code is "100" (three chars).
+-- Codes stay >= 3 chars and grow as rows are added; custom codes are checked
+-- against existing rows.
 INSERT OR IGNORE INTO sqlite_sequence (name, seq) VALUES ('links', 3843);

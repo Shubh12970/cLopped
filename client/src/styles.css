@@ -124,3 +124,6 @@ th, td { text-align: left; padding: 8px 6px; border-top: 1px solid var(--border)
 th { color: var(--muted); font-weight: 500; border-top: none; }
 
 footer { text-align: center; font-size: 0.8rem; margin-top: 24px; }
+
+.qr { margin-top: 10px; }
+.qr img { border-radius: 10px; border: 1px solid var(--border); background: #fff; padding: 8px; }
