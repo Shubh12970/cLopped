@@ -86,6 +86,66 @@ export function validateExpiry(raw) {
   return { expires_at: new Date(t).toISOString() };
 }
 
+// ---- Auth (stage 2): Clerk session verification ----
+//
+// Owner accounts use Clerk (same provider as the StudyFlow dashboard).
+// The client sends the Clerk session token as `Authorization: Bearer <jwt>`.
+// The Worker verifies the RS256 signature against the instance JWKS (cached
+// for an hour), checks expiry and the issuer, and trusts `sub` as the owner
+// id. Anything unverifiable is simply treated as anonymous - the public
+// endpoints keep working.
+//
+// Privacy model:
+//   - Redirects are PUBLIC for every link, owned or not (a short link is
+//     meant to be shared).
+//   - Stats are PUBLIC for anonymous links, PRIVATE for owned links
+//     (owner session required).
+//   - Delete exists only for owned links, enforced server-side by owner id.
+const jwksCache = new Map(); // jwksUrl -> { keys, fetchedAt }
+
+async function getJwks(jwksUrl) {
+  const hit = jwksCache.get(jwksUrl);
+  if (hit && Date.now() - hit.fetchedAt < 3600_000) return hit.keys;
+  const res = await fetch(jwksUrl);
+  if (!res.ok) throw new Error("JWKS fetch failed");
+  const data = await res.json();
+  jwksCache.set(jwksUrl, { keys: data.keys, fetchedAt: Date.now() });
+  return data.keys;
+}
+
+function b64urlDecode(s) {
+  const b = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(b, (c) => c.charCodeAt(0));
+}
+
+// Returns the Clerk user id (sub) for a valid session token, else null.
+export async function verifySessionUser(request, env) {
+  if (!env.CLERK_JWKS_URL || !env.CLERK_ISSUER) return null;
+  const header = request.headers.get("authorization") || "";
+  if (!header.startsWith("Bearer ")) return null;
+  const token = header.slice(7);
+  try {
+    const [h, p, sig] = token.split(".");
+    const payload = JSON.parse(new TextDecoder().decode(b64urlDecode(p)));
+    if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
+    if (payload.iss !== env.CLERK_ISSUER) return null;
+    const headerObj = JSON.parse(new TextDecoder().decode(b64urlDecode(h)));
+    const keys = await getJwks(env.CLERK_JWKS_URL);
+    const jwk = keys.find((k) => k.kid === headerObj.kid);
+    if (!jwk) return null;
+    const key = await crypto.subtle.importKey(
+      "jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]
+    );
+    const ok = await crypto.subtle.verify(
+      "RSASSA-PKCS1-v1_5", key, b64urlDecode(sig), new TextEncoder().encode(`${h}.${p}`)
+    );
+    if (!ok) return null;
+    return payload.sub || null;
+  } catch {
+    return null;
+  }
+}
+
 // Fixed-window per-IP rate limit on creation (30/hour): shorteners get
 // abused to hide malicious links, and an open create endpoint needs a brake.
 // A fixed window can burst 2x at a boundary; the interview upgrade is a
@@ -119,12 +179,14 @@ async function createLink(request, env) {
   if (!(await checkRateLimit(request, env))) {
     return json({ error: "Rate limit: too many links created from your network. Try again in a bit." }, 429);
   }
+  const ownerId = await verifySessionUser(request, env);
   const ownHost = new URL(request.url).hostname;
   const check = validateLongUrl(String(body.url || "").trim(), ownHost);
   if (check.error) return json({ error: check.error }, 400);
   const expiry = validateExpiry(body.expires_at);
   if (expiry.error) return json({ error: expiry.error }, 400);
 
+  const insert = "INSERT INTO links (code, long_url, created_at, expires_at, owner_id) VALUES (?, ?, ?, ?, ?)";
   const custom = typeof body.custom_code === "string" ? body.custom_code.trim() : "";
   if (custom) {
     const codeErr = validateCustomCode(custom);
@@ -135,12 +197,12 @@ async function createLink(request, env) {
     // friendlier error. A concurrent insert can still win the race, so
     // catch the constraint violation and answer 409 the same way.
     try {
-      await env.DB.prepare("INSERT INTO links (code, long_url, created_at, expires_at) VALUES (?, ?, ?, ?)")
-        .bind(custom, check.url, new Date().toISOString(), expiry.expires_at).run();
+      await env.DB.prepare(insert)
+        .bind(custom, check.url, new Date().toISOString(), expiry.expires_at, ownerId).run();
     } catch {
       return json({ error: `The code "${custom}" is already taken.` }, 409);
     }
-    return json({ code: custom, long_url: check.url, short_url: `https://${ownHost}/${custom}`, expires_at: expiry.expires_at }, 201);
+    return json({ code: custom, long_url: check.url, short_url: `https://${ownHost}/${custom}`, expires_at: expiry.expires_at, owned: Boolean(ownerId) }, 201);
   }
 
   // Auto code: insert with a unique placeholder, then set code = base62(id).
@@ -148,13 +210,13 @@ async function createLink(request, env) {
   // gives a different code.
   for (let attempt = 0; attempt < 3; attempt++) {
     const placeholder = "~" + crypto.randomUUID();
-    await env.DB.prepare("INSERT INTO links (code, long_url, created_at, expires_at) VALUES (?, ?, ?, ?)")
-      .bind(placeholder, check.url, new Date().toISOString(), expiry.expires_at).run();
+    await env.DB.prepare(insert)
+      .bind(placeholder, check.url, new Date().toISOString(), expiry.expires_at, ownerId).run();
     const row = await env.DB.prepare("SELECT id FROM links WHERE code = ?").bind(placeholder).first();
     const code = toBase62(row.id);
     try {
       await env.DB.prepare("UPDATE links SET code = ? WHERE id = ?").bind(code, row.id).run();
-      return json({ code, long_url: check.url, short_url: `https://${ownHost}/${code}`, expires_at: expiry.expires_at }, 201);
+      return json({ code, long_url: check.url, short_url: `https://${ownHost}/${code}`, expires_at: expiry.expires_at, owned: Boolean(ownerId) }, 201);
     } catch {
       await env.DB.prepare("DELETE FROM links WHERE id = ?").bind(row.id).run();
     }
@@ -162,9 +224,18 @@ async function createLink(request, env) {
   return json({ error: "Could not allocate a code, please try again." }, 500);
 }
 
-async function getStats(env, code) {
-  const link = await env.DB.prepare("SELECT code, long_url, created_at, expires_at FROM links WHERE code = ?").bind(code).first();
+// Stats are public for anonymous links and private for owned links: the
+// redirect itself is public either way (a short link is meant to be shared),
+// but click analytics belong to the owner.
+async function getStats(request, env, code) {
+  const link = await env.DB.prepare("SELECT code, long_url, created_at, expires_at, owner_id FROM links WHERE code = ?").bind(code).first();
   if (!link) return json({ error: "No link with that code." }, 404);
+  if (link.owner_id) {
+    const userId = await verifySessionUser(request, env);
+    if (userId !== link.owner_id) {
+      return json({ error: "Stats for this link are private to its owner." }, 403);
+    }
+  }
   const total = await env.DB.prepare("SELECT COUNT(*) AS n FROM clicks WHERE link_code = ?").bind(code).first();
   const byDay = await env.DB.prepare(
     `SELECT substr(clicked_at, 1, 10) AS day, COUNT(*) AS clicks
@@ -175,7 +246,41 @@ async function getStats(env, code) {
     `SELECT clicked_at, referrer, country FROM clicks
      WHERE link_code = ? ORDER BY id DESC LIMIT 20`
   ).bind(code).all();
-  return json({ ...link, total_clicks: total.n, by_day: byDay.results, recent: recent.results });
+  const { owner_id, ...rest } = link;
+  return json({ ...rest, owned: Boolean(owner_id), total_clicks: total.n, by_day: byDay.results, recent: recent.results });
+}
+
+// The signed-in user's own links, newest first (stage 2).
+async function listMine(request, env) {
+  const userId = await verifySessionUser(request, env);
+  if (!userId) return json({ error: "Sign in to see your links." }, 401);
+  const rows = await env.DB.prepare(
+    `SELECT code, long_url, created_at, expires_at,
+            (SELECT COUNT(*) FROM clicks WHERE link_code = links.code) AS total_clicks
+     FROM links WHERE owner_id = ? ORDER BY id DESC LIMIT 200`
+  ).bind(userId).all();
+  return json({ links: rows.results });
+}
+
+// Only the owner can delete a link. Anonymous links (owner_id NULL, which
+// includes every link that predates accounts) can never be deleted through
+// the API and are never reassigned. Deleting also drops the edge-cached
+// redirect so a deleted code stops working within seconds, not at cache TTL.
+async function deleteLink(request, env, code) {
+  const userId = await verifySessionUser(request, env);
+  if (!userId) return json({ error: "Sign in to delete a link." }, 401);
+  const link = await env.DB.prepare("SELECT owner_id FROM links WHERE code = ?").bind(code).first();
+  if (!link) return json({ error: "No link with that code." }, 404);
+  if (!link.owner_id || link.owner_id !== userId) {
+    return json({ error: "Only the owner can delete this link." }, 403);
+  }
+  await env.DB.prepare("DELETE FROM clicks WHERE link_code = ?").bind(code).run();
+  await env.DB.prepare("DELETE FROM links WHERE code = ?").bind(code).run();
+  try {
+    const host = new URL(request.url).host;
+    await caches.default.delete(new Request(`https://${host}/${code}`, { method: "GET" }));
+  } catch { /* cache delete is best-effort; the TTL also bounds staleness */ }
+  return json({ deleted: code });
 }
 
 function redirectPage(message, status) {
@@ -228,8 +333,11 @@ export default {
     const path = url.pathname;
 
     if (request.method === "POST" && path === "/api/links") return createLink(request, env);
+    if (request.method === "GET" && path === "/api/links/mine") return listMine(request, env);
     const statsMatch = path.match(/^\/api\/links\/([0-9A-Za-z_-]{1,32})\/stats$/);
-    if (request.method === "GET" && statsMatch) return getStats(env, statsMatch[1]);
+    if (request.method === "GET" && statsMatch) return getStats(request, env, statsMatch[1]);
+    const deleteMatch = path.match(/^\/api\/links\/([0-9A-Za-z_-]{1,32})$/);
+    if (request.method === "DELETE" && deleteMatch) return deleteLink(request, env, deleteMatch[1]);
 
     if (request.method === "GET" && path.length > 1 && !path.startsWith("/api/")) {
       const code = decodeURIComponent(path.slice(1));

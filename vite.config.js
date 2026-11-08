@@ -5,6 +5,7 @@ import react from "@vitejs/plugin-react";
 // Cloudflare Worker serves as static assets (see wrangler.toml).
 export default defineConfig({
   root: "client",
+  envDir: "..", // load .env.production from the repo root
   plugins: [react()],
   build: {
     outDir: "../dist",

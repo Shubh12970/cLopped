@@ -1,7 +1,24 @@
 import React, { useEffect, useState, useCallback } from "react";
 import QRCode from "qrcode";
+import { SignedIn, SignedOut, SignInButton, UserButton, useAuth } from "@clerk/clerk-react";
 
 const shortHref = (code) => `${window.location.origin}/${code}`;
+
+// Sends the Clerk session token when signed in, so owned links get
+// attributed, owned stats unlock, and delete is authorized. Signed-out
+// requests stay anonymous and everything public keeps working.
+function useAuthedFetch() {
+  const { getToken } = useAuth();
+  return useCallback(
+    async (path, options = {}) => {
+      const token = await getToken().catch(() => null);
+      const headers = { ...(options.headers || {}) };
+      if (token) headers.authorization = `Bearer ${token}`;
+      return fetch(path, { ...options, headers });
+    },
+    [getToken]
+  );
+}
 
 function CopyButton({ text }) {
   const [copied, setCopied] = useState(false);
@@ -19,17 +36,20 @@ function CopyButton({ text }) {
   );
 }
 
-// Stage-1 demo has no accounts yet, so "Your links" is browser-local:
-// codes you create are remembered in localStorage and hydrated from the
-// per-code stats endpoint. There is deliberately no global list endpoint -
-// a public feed of everyone's destinations would be an abuse magnet.
-// (Real ownership + delete arrives with accounts in stage 2.)
+// Stage 2 ownership: signed-in users get a server-side list and delete.
+// Signed-out visitors keep the browser-local list: codes they create are
+// remembered in localStorage and hydrated from the public per-code stats
+// endpoint. There is deliberately no global list endpoint - a public feed
+// of everyone's destinations would be an abuse magnet. Anonymous links
+// (including everything created before accounts existed) stay anonymous:
+// they are never reassigned and cannot be deleted through the API.
 const LS_KEY = "snip-links";
 const loadCodes = () => {
   try { return JSON.parse(localStorage.getItem(LS_KEY)) || []; } catch { return []; }
 };
 
 function ShortenForm({ onCreated }) {
+  const authedFetch = useAuthedFetch();
   const [url, setUrl] = useState("");
   const [customCode, setCustomCode] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
@@ -43,7 +63,7 @@ function ShortenForm({ onCreated }) {
     setError("");
     setCreated(null);
     try {
-      const res = await fetch("/api/links", {
+      const res = await authedFetch("/api/links", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -92,7 +112,7 @@ function ShortenForm({ onCreated }) {
             type="date"
             value={expiresAt}
             onChange={(e) => setExpiresAt(e.target.value)}
-            title="Optional expiry date"
+            title="Optional expiry date - the link stops working at 00:00 UTC on this date"
             min={new Date(Date.now() + 86400000).toISOString().slice(0, 10)}
           />
           <button className="btn primary" type="submit" disabled={busy}>
@@ -101,6 +121,7 @@ function ShortenForm({ onCreated }) {
         </div>
       </form>
       {error && <p className="error">{error}</p>}
+      <p className="muted">Expiry dates are UTC: a link expires at 00:00 UTC on the chosen date.</p>
       {created && (
         <div className="created">
           <a href={created.short_url} target="_blank" rel="noreferrer">
@@ -136,12 +157,13 @@ function QrButton({ code }) {
 }
 
 function Stats({ code, onClose }) {
+  const authedFetch = useAuthedFetch();
   const [stats, setStats] = useState(null);
   useEffect(() => {
-    fetch(`/api/links/${encodeURIComponent(code)}/stats`)
+    authedFetch(`/api/links/${encodeURIComponent(code)}/stats`)
       .then((r) => r.json())
       .then(setStats);
-  }, [code]);
+  }, [code, authedFetch]);
 
   if (!stats) return <section className="card"><p>Loading stats...</p></section>;
   if (stats.error) return <section className="card"><p className="error">{stats.error}</p></section>;
@@ -156,7 +178,7 @@ function Stats({ code, onClose }) {
       </div>
       <p className="muted long-url">{stats.long_url}</p>
       {stats.expires_at && (
-        <p className="muted">Expires {new Date(stats.expires_at).toLocaleString()}</p>
+        <p className="muted">Expires {new Date(stats.expires_at).toUTCString()}</p>
       )}
       <p><strong>{stats.total_clicks}</strong> total clicks</p>
       {days.length > 0 ? (
@@ -192,40 +214,76 @@ function Stats({ code, onClose }) {
 }
 
 export default function App() {
+  const authedFetch = useAuthedFetch();
+  const { isSignedIn } = useAuth();
   const [links, setLinks] = useState([]);
   const [theme, setTheme] = useState(() => localStorage.getItem("snip-theme") || "dark");
   const [statsFor, setStatsFor] = useState(null);
+  const [error, setError] = useState("");
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("snip-theme", theme);
   }, [theme]);
 
-  const refresh = useCallback((newCode) => {
-    const codes = loadCodes();
-    if (newCode && !codes.includes(newCode)) {
-      codes.unshift(newCode);
-      localStorage.setItem(LS_KEY, JSON.stringify(codes));
-    }
-    Promise.all(
-      codes.map((c) =>
-        fetch(`/api/links/${encodeURIComponent(c)}/stats`)
-          .then((r) => (r.ok ? r.json() : null))
-          .catch(() => null)
-      )
-    ).then((rows) =>
-      setLinks(rows.filter(Boolean).map((s) => ({ ...s, clicks: s.total_clicks })))
-    );
-  }, []);
+  const refresh = useCallback(
+    (newCode) => {
+      if (isSignedIn) {
+        authedFetch("/api/links/mine")
+          .then((r) => (r.ok ? r.json() : { links: [] }))
+          .then((data) =>
+            setLinks(data.links.map((l) => ({ ...l, clicks: l.total_clicks })))
+          )
+          .catch(() => setLinks([]));
+        return;
+      }
+      const codes = loadCodes();
+      if (newCode && !codes.includes(newCode)) {
+        codes.unshift(newCode);
+        localStorage.setItem(LS_KEY, JSON.stringify(codes));
+      }
+      Promise.all(
+        codes.map((c) =>
+          fetch(`/api/links/${encodeURIComponent(c)}/stats`)
+            .then((r) => (r.ok ? r.json() : null))
+            .catch(() => null)
+        )
+      ).then((rows) =>
+        setLinks(rows.filter(Boolean).map((s) => ({ ...s, clicks: s.total_clicks })))
+      );
+    },
+    [authedFetch, isSignedIn]
+  );
   useEffect(() => { refresh(); }, [refresh]);
+
+  async function remove(code) {
+    setError("");
+    const res = await authedFetch(`/api/links/${encodeURIComponent(code)}`, { method: "DELETE" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setError(data.error || "Could not delete that link.");
+      return;
+    }
+    refresh();
+  }
 
   return (
     <main>
       <header className="row spread">
         <h1>snip <span className="muted">tiny links</span></h1>
-        <button className="btn ghost" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
-          {theme === "dark" ? "Light mode" : "Dark mode"}
-        </button>
+        <div className="row">
+          <button className="btn ghost" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+            {theme === "dark" ? "Light mode" : "Dark mode"}
+          </button>
+          <SignedOut>
+            <SignInButton mode="modal">
+              <button className="btn primary">Sign in</button>
+            </SignInButton>
+          </SignedOut>
+          <SignedIn>
+            <UserButton afterSignOutUrl="/" />
+          </SignedIn>
+        </div>
       </header>
 
       <ShortenForm onCreated={refresh} />
@@ -234,6 +292,13 @@ export default function App() {
 
       <section className="card">
         <h2>Your links</h2>
+        <SignedOut>
+          <p className="muted">
+            Saved in this browser only. Sign in to keep links on your account,
+            get private stats, and delete them.
+          </p>
+        </SignedOut>
+        {error && <p className="error">{error}</p>}
         {links.length === 0 && <p className="muted">No links yet. Shorten your first one above.</p>}
         {links.map((l) => (
           <div className="link-row" key={l.code}>
@@ -242,12 +307,18 @@ export default function App() {
                 /{l.code}
               </a>
               <span className="muted long-url">{l.long_url}</span>
+              {l.expires_at && (
+                <span className="muted"> - expires {new Date(l.expires_at).toUTCString()}</span>
+              )}
             </div>
             <div className="row">
               <span className="badge">{l.clicks} clicks</span>
               <button className="btn ghost" onClick={() => setStatsFor(l.code)}>Stats</button>
               <QrButton code={l.code} />
               <CopyButton text={shortHref(l.code)} />
+              <SignedIn>
+                <button className="btn ghost" onClick={() => remove(l.code)}>Delete</button>
+              </SignedIn>
             </div>
           </div>
         ))}
@@ -255,6 +326,7 @@ export default function App() {
 
       <footer className="muted">
         302 redirects keep clicks countable - counts are approximate (bots and prefetching click too).
+        Redirects are public; stats for signed-in links are private to the owner.
       </footer>
     </main>
   );

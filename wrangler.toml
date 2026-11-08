@@ -11,3 +11,10 @@ assets = { directory = "./dist", binding = "ASSETS" }
 binding = "DB"
 database_name = "url_shortener"
 database_id = "c6b8c1cb-3835-4352-984c-408c79ee816b"
+
+# Clerk (stage 2 owner accounts). Publishable/issuer values are public by
+# design; there is no Clerk secret in the Worker - sessions are verified
+# against the instance JWKS with WebCrypto.
+[vars]
+CLERK_ISSUER = "https://concise-mosquito-7709.clerk.accounts.dev"
+CLERK_JWKS_URL = "https://concise-mosquito-7709.clerk.accounts.dev/.well-known/jwks.json"
