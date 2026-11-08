@@ -25,6 +25,16 @@ CREATE TABLE IF NOT EXISTS clicks (
 );
 CREATE INDEX IF NOT EXISTS idx_clicks_link ON clicks(link_code, clicked_at);
 
+-- Abuse control: fixed 1-hour window per client IP for link creation.
+-- (A fixed window can burst 2x at a boundary; a sliding window or token
+-- bucket is the interview upgrade.)
+CREATE TABLE IF NOT EXISTS rate_limits (
+  ip TEXT NOT NULL,
+  window_start TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (ip, window_start)
+);
+
 -- Start auto ids at 3844 so the first generated code is "1Bc" (three chars),
 -- matching the base62 example in the design notes. Codes stay >= 3 chars and
 -- grow as rows are added; custom codes are checked against existing rows.

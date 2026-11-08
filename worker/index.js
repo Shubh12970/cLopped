@@ -2,7 +2,6 @@
 //
 // Routes:
 //   POST /api/links                 { url, custom_code? } -> 201 { code, short_url, long_url }
-//   GET  /api/links                 -> { links: [{ code, long_url, created_at, clicks }] }
 //   GET  /api/links/:code/stats     -> { code, long_url, created_at, total_clicks, by_day, recent }
 //   GET  /:code                     -> 302 Location: long_url (the hot path: lookup, log click, redirect)
 //
@@ -35,6 +34,7 @@ function json(data, status = 200) {
 // http/https only, never point at ourselves (redirect loop), never at
 // private/local network addresses.
 function validateLongUrl(raw, ownHost) {
+  if (raw.length > 2048) return { error: "That URL is too long (2048 characters max)." };
   let u;
   try {
     u = new URL(raw);
@@ -58,12 +58,32 @@ function validateLongUrl(raw, ownHost) {
   return { url: u.toString() };
 }
 
+// Fixed-window per-IP rate limit on creation (30/hour): shorteners get
+// abused to hide malicious links, and an open create endpoint needs a brake.
+// True per-user limits arrive with accounts in stage 2.
+const CREATE_LIMIT_PER_HOUR = 30;
+async function checkRateLimit(request, env) {
+  const ip = request.headers.get("cf-connecting-ip") || "unknown";
+  const windowStart = new Date(Math.floor(Date.now() / 3600000) * 3600000).toISOString();
+  const row = await env.DB.prepare("SELECT count FROM rate_limits WHERE ip = ? AND window_start = ?")
+    .bind(ip, windowStart).first();
+  if (row && row.count >= CREATE_LIMIT_PER_HOUR) return false;
+  await env.DB.prepare(
+    `INSERT INTO rate_limits (ip, window_start, count) VALUES (?, ?, 1)
+     ON CONFLICT(ip, window_start) DO UPDATE SET count = count + 1`
+  ).bind(ip, windowStart).run();
+  return true;
+}
+
 async function createLink(request, env) {
   let body;
   try {
     body = await request.json();
   } catch {
     return json({ error: "Expected a JSON body like { \"url\": \"https://...\" }." }, 400);
+  }
+  if (!(await checkRateLimit(request, env))) {
+    return json({ error: "Rate limit: too many links created from your network. Try again in a bit." }, 429);
   }
   const ownHost = new URL(request.url).hostname;
   const check = validateLongUrl(String(body.url || "").trim(), ownHost);
@@ -98,18 +118,6 @@ async function createLink(request, env) {
     }
   }
   return json({ error: "Could not allocate a code, please try again." }, 500);
-}
-
-async function listLinks(env) {
-  const { results } = await env.DB.prepare(
-    `SELECT l.code, l.long_url, l.created_at,
-            (SELECT COUNT(*) FROM clicks c WHERE c.link_code = l.code) AS clicks
-     FROM links l
-     WHERE l.code NOT LIKE '~%'
-     ORDER BY l.id DESC
-     LIMIT 100`
-  ).all();
-  return json({ links: results });
 }
 
 async function getStats(env, code) {
@@ -158,7 +166,6 @@ export default {
     const path = url.pathname;
 
     if (request.method === "POST" && path === "/api/links") return createLink(request, env);
-    if (request.method === "GET" && path === "/api/links") return listLinks(env);
     const statsMatch = path.match(/^\/api\/links\/([0-9A-Za-z_-]{1,32})\/stats$/);
     if (request.method === "GET" && statsMatch) return getStats(env, statsMatch[1]);
 

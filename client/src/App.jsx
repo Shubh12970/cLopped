@@ -18,6 +18,16 @@ function CopyButton({ text }) {
   );
 }
 
+// Stage-1 demo has no accounts yet, so "Your links" is browser-local:
+// codes you create are remembered in localStorage and hydrated from the
+// per-code stats endpoint. There is deliberately no global list endpoint -
+// a public feed of everyone's destinations would be an abuse magnet.
+// (Real ownership + delete arrives with accounts in stage 2.)
+const LS_KEY = "snip-links";
+const loadCodes = () => {
+  try { return JSON.parse(localStorage.getItem(LS_KEY)) || []; } catch { return []; }
+};
+
 function ShortenForm({ onCreated }) {
   const [url, setUrl] = useState("");
   const [customCode, setCustomCode] = useState("");
@@ -43,7 +53,7 @@ function ShortenForm({ onCreated }) {
         setCreated(data);
         setUrl("");
         setCustomCode("");
-        onCreated();
+        onCreated(data.code);
       }
     } catch {
       setError("Network error - is the API up?");
@@ -153,10 +163,23 @@ export default function App() {
     localStorage.setItem("snip-theme", theme);
   }, [theme]);
 
-  const refresh = useCallback(() => {
-    fetch("/api/links").then((r) => r.json()).then((d) => setLinks(d.links || []));
+  const refresh = useCallback((newCode) => {
+    const codes = loadCodes();
+    if (newCode && !codes.includes(newCode)) {
+      codes.unshift(newCode);
+      localStorage.setItem(LS_KEY, JSON.stringify(codes));
+    }
+    Promise.all(
+      codes.map((c) =>
+        fetch(`/api/links/${encodeURIComponent(c)}/stats`)
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null)
+      )
+    ).then((rows) =>
+      setLinks(rows.filter(Boolean).map((s) => ({ ...s, clicks: s.total_clicks })))
+    );
   }, []);
-  useEffect(refresh, [refresh]);
+  useEffect(() => { refresh(); }, [refresh]);
 
   return (
     <main>
