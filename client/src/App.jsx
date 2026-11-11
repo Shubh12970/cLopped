@@ -54,6 +54,7 @@ function ShortenForm({ onCreated }) {
   const [customCode, setCustomCode] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
   const [busy, setBusy] = useState(false);
+  const [unguessable, setUnguessable] = useState(false);
   const [error, setError] = useState("");
   const [created, setCreated] = useState(null);
 
@@ -70,6 +71,7 @@ function ShortenForm({ onCreated }) {
           url,
           custom_code: customCode || undefined,
           expires_at: expiresAt || undefined,
+          code_style: unguessable && !customCode ? "random" : undefined,
         }),
       });
       const data = await res.json();
@@ -120,6 +122,16 @@ function ShortenForm({ onCreated }) {
           </button>
         </div>
       </form>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={unguessable}
+          onChange={(e) => setUnguessable(e.target.checked)}
+          disabled={Boolean(customCode)}
+        />
+        Unguessable code - a random 8-character code that cannot be found by
+        walking sequential numbers (ignored when a custom code is set)
+      </label>
       {error && <p className="error">{error}</p>}
       <p className="muted">Expiry dates are UTC: a link expires at 00:00 UTC on the chosen date.</p>
       {created && (
@@ -192,6 +204,26 @@ function Stats({ code, onClose }) {
         </div>
       ) : (
         <p className="muted">No clicks yet - share the link to see the chart grow.</p>
+      )}
+      {stats.by_hour && stats.total_clicks > 0 && (
+        <div className="heat-wrap">
+          <p className="muted">Clicks by hour (UTC - India is UTC+5:30, so add 5:30 to read it locally)</p>
+          <div className="heat" title="Clicks by hour of day (UTC)">
+            {stats.by_hour.map((h) => {
+              const maxH = Math.max(1, ...stats.by_hour.map((x) => x.clicks));
+              return (
+                <div
+                  key={h.hour}
+                  className="heat-cell"
+                  style={{ opacity: h.clicks === 0 ? 0.15 : 0.25 + (0.75 * h.clicks) / maxH }}
+                  title={`${String(h.hour).padStart(2, "0")}:00 UTC - ${h.clicks} clicks`}
+                >
+                  <span>{h.hour}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
       )}
       {stats.recent.length > 0 && (
         <table>

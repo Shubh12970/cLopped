@@ -26,6 +26,27 @@ export function toBase62(n) {
   return s;
 }
 
+// Unguessable codes: 8 random base62 characters drawn from crypto
+// randomness, for links the owner does not want discoverable by walking
+// sequential codes. 62^8 is about 218 trillion codes, so collisions are
+// astronomically rare - but possible in principle, so the insert still
+// retries on the UNIQUE constraint. Bytes >= 248 are discarded (248 is the
+// largest multiple of 62 that fits in a byte), so every character is
+// equally likely - naive `byte % 62` would slightly favour early digits.
+const RANDOM_CODE_LENGTH = 8;
+export function randomCode(length = RANDOM_CODE_LENGTH) {
+  let s = "";
+  while (s.length < length) {
+    const bytes = crypto.getRandomValues(new Uint8Array(length * 2));
+    for (const b of bytes) {
+      if (b >= 248) continue;
+      s += BASE62[b % 62];
+      if (s.length === length) break;
+    }
+  }
+  return s;
+}
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -205,6 +226,19 @@ async function createLink(request, env) {
     return json({ code: custom, long_url: check.url, short_url: `https://${ownHost}/${custom}`, expires_at: expiry.expires_at, owned: Boolean(ownerId) }, 201);
   }
 
+  // Unguessable code (opt-in): random string, retry on the rare collision.
+  if (body.code_style === "random") {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const code = randomCode();
+      try {
+        await env.DB.prepare(insert)
+          .bind(code, check.url, new Date().toISOString(), expiry.expires_at, ownerId).run();
+        return json({ code, long_url: check.url, short_url: `https://${ownHost}/${code}`, expires_at: expiry.expires_at, owned: Boolean(ownerId) }, 201);
+      } catch { /* UNIQUE collision: draw again */ }
+    }
+    return json({ error: "Could not allocate a code, please try again." }, 500);
+  }
+
   // Auto code: insert with a unique placeholder, then set code = base62(id).
   // If that string is already taken by a custom code, retry; the next id
   // gives a different code.
@@ -242,12 +276,18 @@ async function getStats(request, env, code) {
      FROM clicks WHERE link_code = ?
      GROUP BY day ORDER BY day DESC LIMIT 30`
   ).bind(code).all();
+  const byHour = await env.DB.prepare(
+    `SELECT substr(clicked_at, 12, 2) AS hour, COUNT(*) AS clicks
+     FROM clicks WHERE link_code = ? GROUP BY hour`
+  ).bind(code).all();
+  const by_hour = Array.from({ length: 24 }, (_, h) => ({ hour: h, clicks: 0 }));
+  for (const r of byHour.results) by_hour[parseInt(r.hour, 10)].clicks = r.clicks;
   const recent = await env.DB.prepare(
     `SELECT clicked_at, referrer, country FROM clicks
      WHERE link_code = ? ORDER BY id DESC LIMIT 20`
   ).bind(code).all();
   const { owner_id, ...rest } = link;
-  return json({ ...rest, owned: Boolean(owner_id), total_clicks: total.n, by_day: byDay.results, recent: recent.results });
+  return json({ ...rest, owned: Boolean(owner_id), total_clicks: total.n, by_day: byDay.results, by_hour, recent: recent.results });
 }
 
 // The signed-in user's own links, newest first (stage 2).

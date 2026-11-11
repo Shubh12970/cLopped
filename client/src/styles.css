@@ -127,3 +127,11 @@ footer { text-align: center; font-size: 0.8rem; margin-top: 24px; }
 
 .qr { margin-top: 10px; }
 .qr img { border-radius: 10px; border: 1px solid var(--border); background: #fff; padding: 8px; }
+
+/* Unguessable-code checkbox and clicks-by-hour heatmap */
+.check { display: flex; gap: 0.5rem; align-items: flex-start; font-size: 0.85rem; margin-top: 0.6rem; cursor: pointer; }
+.check input { margin-top: 0.15rem; }
+.heat-wrap { margin-top: 1rem; }
+.heat { display: grid; grid-template-columns: repeat(12, 1fr); gap: 4px; margin-top: 0.4rem; }
+.heat-cell { background: #8f85ff; border-radius: 4px; text-align: center; padding: 0.3rem 0; font-size: 0.65rem; color: #12121a; }
+.heat-cell span { font-weight: 600; }

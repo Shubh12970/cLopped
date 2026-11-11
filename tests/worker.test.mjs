@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { toBase62, validateLongUrl, validateCustomCode, validateExpiry, hourWindowStart } from "../worker/index.js";
+import { toBase62, randomCode, validateLongUrl, validateCustomCode, validateExpiry, hourWindowStart } from "../worker/index.js";
 
 describe("toBase62", () => {
   it("encodes 0", () => expect(toBase62(0)).toBe("0"));
@@ -49,4 +49,20 @@ describe("validateExpiry", () => {
 describe("hourWindowStart", () => {
   it("floors to the hour", () =>
     expect(hourWindowStart(Date.parse("2026-11-09T02:37:41Z"))).toBe("2026-11-09T02:00:00.000Z"));
+});
+
+describe("randomCode (unguessable short codes)", () => {
+  it("returns 8 base62 characters by default", () => {
+    expect(randomCode()).toMatch(/^[0-9a-zA-Z]{8}$/);
+  });
+
+  it("honours a custom length", () => {
+    expect(randomCode(12)).toHaveLength(12);
+  });
+
+  it("does not repeat across many draws", () => {
+    const seen = new Set();
+    for (let i = 0; i < 500; i++) seen.add(randomCode());
+    expect(seen.size).toBe(500);
+  });
 });
