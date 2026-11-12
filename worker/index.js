@@ -1,4 +1,4 @@
-// URL shortener API + redirect worker.
+// cLopped API + redirect worker.
 //
 // Routes:
 //   POST /api/links                 { url, custom_code?, expires_at? } -> 201 { code, short_url, long_url }

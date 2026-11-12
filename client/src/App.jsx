@@ -443,7 +443,7 @@ export default function App() {
   return (
     <main>
       <header className="row spread">
-        <h1>snip <span className="muted">tiny links</span></h1>
+        <h1>cLopped <span className="muted">tiny links</span></h1>
         <div className="row">
           <button className="btn ghost" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
             {theme === "dark" ? "Light mode" : "Dark mode"}

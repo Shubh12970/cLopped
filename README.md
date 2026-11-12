@@ -1,10 +1,10 @@
-# URL shortener
+# cLopped - URL shortener
 
 A TinyURL-style URL shortener built as a system-design learning project.
 Paste a long URL, get a short link; visiting it returns a 302 redirect while
 an asynchronous click log feeds analytics.
 
-**Live demo:** https://url-shortener.2wf0w2.workers.dev
+**Live demo:** https://clopped.2wf0w2.workers.dev
 
 ## Features
 
