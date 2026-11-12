@@ -2,6 +2,9 @@
 //
 // Routes:
 //   POST /api/links                 { url, custom_code?, expires_at? } -> 201 { code, short_url, long_url }
+//   POST /api/tokens   {name} -> mint a personal API token (signed-in only; shown once)
+//   GET  /api/tokens   -> list your tokens (never the raw token)
+//   DELETE /api/tokens/:id -> revoke one of your tokens
 //   GET  /api/links/:code/stats     -> { code, long_url, created_at, expires_at, max_clicks, total_clicks, by_day, by_hour, by_referrer, by_country, recent }
 //   GET  /:code                     -> 302 Location: long_url (the hot path: cache, lookup, log click, redirect)
 //                                     410 if the link has expired, 404 if it never existed
@@ -461,6 +464,49 @@ async function redirect(request, env, ctx, code) {
   });
   if (!cached && cacheable) ctx.waitUntil(caches.default.put(cacheKey, res.clone()));
   return res;
+}
+
+// ---- Personal API tokens (stage 2): scripted access to your own account ----
+//
+// A signed-in user can mint a token (shown once), then call the API with
+// "Authorization: Bearer us_...". Only the SHA-256 hash is stored, so a
+// database leak cannot leak usable tokens. Token-authed requests act as
+// the token's owner: links they create are owned, with private stats.
+
+async function createToken(request, env) {
+  const userId = await verifySessionUser(request, env);
+  if (!userId) return json({ error: "Sign in to create an API token." }, 401);
+  let body = {};
+  try { body = await request.json(); } catch { /* empty body is fine */ }
+  const name = String(body.name || "").trim().slice(0, 60) || "default";
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  const token = "us_" + [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const hash = await sha256Hex(token);
+  await env.DB.prepare("INSERT INTO api_tokens (owner_id, name, token_hash, created_at) VALUES (?, ?, ?, ?)")
+    .bind(userId, name, hash, new Date().toISOString()).run();
+  const row = await env.DB.prepare("SELECT id, created_at FROM api_tokens WHERE token_hash = ?").bind(hash).first();
+  // The raw token is returned exactly once, here; it cannot be recovered later.
+  return json({ id: row.id, name, token, created_at: row.created_at }, 201);
+}
+
+async function listTokens(request, env) {
+  const userId = await verifySessionUser(request, env);
+  if (!userId) return json({ error: "Sign in to see your API tokens." }, 401);
+  const rows = await env.DB.prepare(
+    "SELECT id, name, created_at, last_used_at FROM api_tokens WHERE owner_id = ? ORDER BY id DESC"
+  ).bind(userId).all();
+  return json({ tokens: rows.results });
+}
+
+async function deleteToken(request, env, id) {
+  const userId = await verifySessionUser(request, env);
+  if (!userId) return json({ error: "Sign in to revoke an API token." }, 401);
+  const row = await env.DB.prepare("SELECT owner_id FROM api_tokens WHERE id = ?").bind(id).first();
+  if (!row) return json({ error: "No token with that id." }, 404);
+  if (row.owner_id !== userId) return json({ error: "That token belongs to someone else." }, 403);
+  await env.DB.prepare("DELETE FROM api_tokens WHERE id = ?").bind(id).run();
+  return new Response(null, { status: 204 });
 }
 
 export default {

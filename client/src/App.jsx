@@ -146,7 +146,7 @@ function ShortenForm({ onCreated }) {
         walking sequential numbers (ignored when a custom code is set)
       </label>
       {error && <p className="error">{error}</p>}
-      <p className="muted">Expiry dates are UTC: a link expires at 00:00 UTC on the chosen date. With a click limit, the link ends after that many clicks (the count is approximate, so the end can be off by a few).</p>
+      <p className="muted">Expiry dates are UTC: a link expires at 00:00 UTC on the chosen date. With a click limit, the link ends after exactly that many redirects.</p>
       {created && (
         <div className="created">
           <a href={created.short_url} target="_blank" rel="noreferrer">
@@ -302,6 +302,90 @@ function Stats({ code, onClose }) {
   );
 }
 
+
+function ApiTokens() {
+  const authedFetch = useAuthedFetch();
+  const [tokens, setTokens] = useState([]);
+  const [name, setName] = useState("");
+  const [fresh, setFresh] = useState(null);
+  const [err, setErr] = useState("");
+
+  const load = useCallback(() => {
+    authedFetch("/api/tokens")
+      .then((r) => (r.ok ? r.json() : { tokens: [] }))
+      .then((d) => setTokens(d.tokens))
+      .catch(() => setTokens([]));
+  }, [authedFetch]);
+  useEffect(() => { load(); }, [load]);
+
+  async function generate(e) {
+    e.preventDefault();
+    setErr("");
+    const res = await authedFetch("/api/tokens", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { setErr(data.error || "Could not create a token."); return; }
+    setFresh(data.token);
+    setName("");
+    load();
+  }
+
+  async function revoke(id) {
+    setErr("");
+    const res = await authedFetch(`/api/tokens/${id}`, { method: "DELETE" });
+    if (!res.ok) setErr("Could not revoke that token.");
+    load();
+  }
+
+  return (
+    <section className="card">
+      <h2>API tokens</h2>
+      <p className="muted">
+        For scripts: call the API with <code>Authorization: Bearer &lt;token&gt;</code>.
+        Links created with a token belong to your account. A token is shown once,
+        when it is created - save it somewhere safe.
+      </p>
+      <form className="row" onSubmit={generate}>
+        <input
+          type="text"
+          placeholder="Token name (e.g. my-script)"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          maxLength={60}
+        />
+        <button className="btn primary" type="submit">Generate</button>
+      </form>
+      {err && <p className="error">{err}</p>}
+      {fresh && (
+        <div className="created">
+          <p><strong>New token (shown once):</strong></p>
+          <div className="row">
+            <code className="code">{fresh}</code>
+            <CopyButton text={fresh} />
+          </div>
+        </div>
+      )}
+      {tokens.length > 0 && tokens.map((t) => (
+        <div className="link-row" key={t.id}>
+          <div>
+            <span>{t.name}</span>
+            <span className="muted">
+              {" "}made {new Date(t.created_at).toUTCString()}
+              {t.last_used_at ? ` - last used ${new Date(t.last_used_at).toUTCString()}` : " - never used"}
+            </span>
+          </div>
+          <div className="row">
+            <button className="btn ghost" onClick={() => revoke(t.id)}>Revoke</button>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
 export default function App() {
   const authedFetch = useAuthedFetch();
   const { isSignedIn } = useAuth();
@@ -415,6 +499,10 @@ export default function App() {
           </div>
         ))}
       </section>
+
+      <SignedIn>
+        <ApiTokens />
+      </SignedIn>
 
       <footer className="muted">
         302 redirects keep clicks countable - counts are approximate (bots and prefetching click too).

@@ -42,6 +42,7 @@ function fakeDb() {
   const links = [];
   const clicks = [];
   const createEvents = [];
+  const apiTokens = [];
   let nextId = 1;
   const route = (sql, args) => {
     sql = sql.replace(/\s+/g, " ").trim();
@@ -142,6 +143,36 @@ function fakeDb() {
           total_clicks: clicks.filter((c) => c.link_code === l.code).length }))
         .reverse() } };
     }
+    if (sql.startsWith("INSERT INTO api_tokens")) {
+      apiTokens.push({ id: apiTokens.length + 1, owner_id: args[0], name: args[1], token_hash: args[2], created_at: args[3], last_used_at: null });
+      return { run: true };
+    }
+    if ((m = sql.match(/^SELECT id, created_at FROM api_tokens WHERE token_hash = \?$/))) {
+      const t = apiTokens.find((x) => x.token_hash === args[0]);
+      return { first: t ? { id: t.id, created_at: t.created_at } : null };
+    }
+    if ((m = sql.match(/^SELECT owner_id FROM api_tokens WHERE token_hash = \?$/))) {
+      const t = apiTokens.find((x) => x.token_hash === args[0]);
+      return { first: t ? { owner_id: t.owner_id } : null };
+    }
+    if (sql.startsWith("UPDATE api_tokens SET last_used_at")) {
+      const t = apiTokens.find((x) => x.token_hash === args[1]);
+      if (t) t.last_used_at = args[0];
+      return { run: true };
+    }
+    if (sql.startsWith("SELECT id, name, created_at, last_used_at FROM api_tokens WHERE owner_id")) {
+      return { all: { results: apiTokens.filter((t) => t.owner_id === args[0])
+        .map((t) => ({ id: t.id, name: t.name, created_at: t.created_at, last_used_at: t.last_used_at })).reverse() } };
+    }
+    if ((m = sql.match(/^SELECT owner_id FROM api_tokens WHERE id = \?$/))) {
+      const t = apiTokens.find((x) => x.id === args[0]);
+      return { first: t ? { owner_id: t.owner_id } : null };
+    }
+    if (sql.startsWith("DELETE FROM api_tokens WHERE id")) {
+      const i = apiTokens.findIndex((x) => x.id === args[0]);
+      if (i >= 0) apiTokens.splice(i, 1);
+      return { run: true };
+    }
     if (sql.startsWith("UPDATE links SET clicks_used = clicks_used + 1")) {
       const l = links.find((x) => x.code === args[0]);
       if (!l || (l.clicks_used || 0) >= l.max_clicks) return { first: null };
@@ -169,6 +200,7 @@ function fakeDb() {
     },
     _links: links,
     _createEvents: createEvents,
+    _apiTokens: apiTokens,
   };
 }
 
@@ -421,5 +453,76 @@ describe("click-count limit (max_clicks)", () => {
       const r = await createLink(e, null, { url: "https://example.com", max_clicks: bad });
       expect(r.status).toBe(400);
     }
+  });
+});
+
+describe("personal API tokens", () => {
+  const mint = async (e, token, name = "script") => {
+    const res = await worker.fetch(new Request("https://short.dev/api/tokens", {
+      method: "POST", ...authed(token), body: JSON.stringify({ name }),
+    }), e, ctx);
+    return { status: res.status, data: res.status === 204 ? null : await res.json() };
+  };
+
+  it("minting requires a signed-in session", async () => {
+    const e = env();
+    const res = await worker.fetch(new Request("https://short.dev/api/tokens", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    }), e, ctx);
+    expect(res.status).toBe(401);
+  });
+
+  it("a token authenticates creates as its owner (stats stay private)", async () => {
+    const e = env();
+    const session = await makeToken("user_a");
+    const m = await mint(e, session, "ci");
+    expect(m.status).toBe(201);
+    expect(m.data.token).toMatch(/^us_[0-9a-f]{48}$/);
+    const r = await createLink(e, m.data.token, { url: "https://example.com/api" });
+    expect(r.status).toBe(201);
+    expect(r.data.owned).toBe(true);
+    expect(e.DB._links.at(-1).owner_id).toBe("user_a");
+    const anon = await worker.fetch(new Request(`https://short.dev/api/links/${r.data.code}/stats`), e, ctx);
+    expect(anon.status).toBe(403);
+    const viaToken = await worker.fetch(new Request(`https://short.dev/api/links/${r.data.code}/stats`,
+      { headers: { authorization: `Bearer ${m.data.token}` } }), e, ctx);
+    expect(viaToken.status).toBe(200);
+  });
+
+  it("an unknown token does not authenticate (create falls back to anonymous)", async () => {
+    const e = env();
+    const r = await createLink(e, "us_" + "0".repeat(48), { url: "https://example.com" });
+    expect(r.status).toBe(201);
+    expect(r.data.owned).toBe(false);
+  });
+
+  it("lists tokens without the raw token, scoped to the owner", async () => {
+    const e = env();
+    const a = await makeToken("user_a");
+    const b = await makeToken("user_b");
+    await mint(e, a, "one");
+    await mint(e, a, "two");
+    await mint(e, b, "bee");
+    const list = async (t) => (await (await worker.fetch(new Request("https://short.dev/api/tokens",
+      authed(t)), e, ctx)).json()).tokens;
+    const mine = await list(a);
+    expect(mine.map((t) => t.name).sort()).toEqual(["one", "two"]);
+    expect(mine.every((t) => !("token" in t) && !("token_hash" in t))).toBe(true);
+    expect((await list(b)).map((t) => t.name)).toEqual(["bee"]);
+  });
+
+  it("revoking a token stops it working; you cannot revoke someone else's", async () => {
+    const e = env();
+    const a = await makeToken("user_a");
+    const b = await makeToken("user_b");
+    const m = await mint(e, a);
+    const other = await mint(e, b);
+    const del = (t, id) => worker.fetch(new Request(`https://short.dev/api/tokens/${id}`,
+      { method: "DELETE", headers: authed(t).headers }), e, ctx);
+    expect((await del(a, other.data.id)).status).toBe(403);
+    expect((await del(a, 9999)).status).toBe(404);
+    expect((await del(a, m.data.id)).status).toBe(204);
+    const r = await createLink(e, m.data.token, { url: "https://example.com" });
+    expect(r.data.owned).toBe(false);
   });
 });
