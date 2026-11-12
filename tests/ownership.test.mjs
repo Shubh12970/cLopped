@@ -59,9 +59,9 @@ function fakeDb() {
       return { run: true };
     }
     if (sql.startsWith("INSERT INTO links")) {
-      const [code, long_url, created_at, expires_at, owner_id] = args;
+      const [code, long_url, created_at, expires_at, owner_id, max_clicks] = args;
       if (links.some((l) => l.code === code)) throw new Error("UNIQUE constraint failed");
-      links.push({ id: nextId++, code, long_url, created_at, expires_at: expires_at ?? null, owner_id: owner_id ?? null });
+      links.push({ id: nextId++, code, long_url, created_at, expires_at: expires_at ?? null, owner_id: owner_id ?? null, max_clicks: max_clicks ?? null });
       return { run: true };
     }
     if (sql.startsWith("SELECT 1 FROM links WHERE code")) {
@@ -92,17 +92,17 @@ function fakeDb() {
       for (let i = clicks.length - 1; i >= 0; i--) if (clicks[i].link_code === args[0]) clicks.splice(i, 1);
       return { run: true };
     }
-    if (sql.startsWith("SELECT code, long_url, created_at, expires_at, owner_id FROM links WHERE code")) {
+    if (sql.startsWith("SELECT code, long_url, created_at, expires_at, max_clicks, owner_id FROM links WHERE code")) {
       const l = links.find((x) => x.code === args[0]);
-      return { first: l ? { code: l.code, long_url: l.long_url, created_at: l.created_at, expires_at: l.expires_at, owner_id: l.owner_id } : null };
+      return { first: l ? { code: l.code, long_url: l.long_url, created_at: l.created_at, expires_at: l.expires_at, max_clicks: l.max_clicks, owner_id: l.owner_id } : null };
     }
     if (sql.startsWith("SELECT owner_id FROM links WHERE code")) {
       const l = links.find((x) => x.code === args[0]);
       return { first: l ? { owner_id: l.owner_id } : null };
     }
-    if (sql.startsWith("SELECT long_url, expires_at FROM links WHERE code")) {
+    if (sql.startsWith("SELECT long_url, expires_at, max_clicks FROM links WHERE code")) {
       const l = links.find((x) => x.code === args[0]);
-      return { first: l ? { long_url: l.long_url, expires_at: l.expires_at } : null };
+      return { first: l ? { long_url: l.long_url, expires_at: l.expires_at, max_clicks: l.max_clicks } : null };
     }
     if (sql.startsWith("SELECT COUNT(*) AS n FROM clicks")) {
       return { first: { n: clicks.filter((c) => c.link_code === args[0]).length } };
@@ -136,9 +136,9 @@ function fakeDb() {
     if (sql.startsWith("SELECT clicked_at, referrer, country")) {
       return { all: { results: clicks.filter((c) => c.link_code === args[0]).slice(-20).reverse() } };
     }
-    if (sql.startsWith("SELECT code, long_url, created_at, expires_at,")) {
+    if (sql.startsWith("SELECT code, long_url, created_at, expires_at, max_clicks, (SELECT COUNT(*)")) {
       return { all: { results: links.filter((l) => l.owner_id === args[0])
-        .map((l) => ({ code: l.code, long_url: l.long_url, created_at: l.created_at, expires_at: l.expires_at,
+        .map((l) => ({ code: l.code, long_url: l.long_url, created_at: l.created_at, expires_at: l.expires_at, max_clicks: l.max_clicks,
           total_clicks: clicks.filter((c) => c.link_code === l.code).length }))
         .reverse() } };
     }
@@ -166,12 +166,13 @@ function fakeDb() {
   };
 }
 
-let cacheDeletes;
+let cacheDeletes, cachePuts;
 beforeEach(() => {
   cacheDeletes = [];
+  cachePuts = [];
   globalThis.caches = { default: {
     match: async () => undefined,
-    put: async () => {},
+    put: async (req) => { cachePuts.push(req.url); },
     delete: async (req) => { cacheDeletes.push(req.url); return true; },
   } };
   const jwks = JSON.stringify({ keys: [publicJwk] });
@@ -360,5 +361,48 @@ describe("sliding-window create rate limit", () => {
     for (let i = 0; i < 30; i++) e.DB._createEvents.push({ ip: "9.9.9.7", created_at: now });
     expect((await createFrom(e, "9.9.9.7", "blocked")).status).toBe(429);
     expect((await createFrom(e, "9.9.9.6", "fine")).status).toBe(201);
+  });
+});
+
+describe("click-count limit (max_clicks)", () => {
+  const hit = (env, code) => worker.fetch(new Request(`https://short.dev/${code}`), env, ctx);
+
+  it("redirects up to the limit, then shows the ended page (410)", async () => {
+    const e = env();
+    const c = await createLink(e, null, { url: "https://example.com", max_clicks: 2 });
+    expect(c.status).toBe(201);
+    expect(c.data.max_clicks).toBe(2);
+    expect((await hit(e, c.data.code)).status).toBe(302);
+    expect((await hit(e, c.data.code)).status).toBe(302);
+    const ended = await hit(e, c.data.code);
+    expect(ended.status).toBe(410);
+    expect(await ended.text()).toContain("click limit");
+  });
+
+  it("limited links are not edge-cached (a cached 302 could outlive the end)", async () => {
+    const e = env();
+    const capped = await createLink(e, null, { url: "https://example.com/a", max_clicks: 100 });
+    await hit(e, capped.data.code);
+    expect(cachePuts).toEqual([]);
+    const plain = await createLink(e, null, { url: "https://example.com/b" });
+    await hit(e, plain.data.code);
+    expect(cachePuts).toEqual([`https://short.dev/${plain.data.code}`]);
+  });
+
+  it("visits past the end are not logged as clicks", async () => {
+    const e = env();
+    const c = await createLink(e, null, { url: "https://example.com", max_clicks: 1 });
+    await hit(e, c.data.code);
+    await hit(e, c.data.code);
+    const stats = await worker.fetch(new Request(`https://short.dev/api/links/${c.data.code}/stats`), e, ctx);
+    expect((await stats.json()).total_clicks).toBe(1);
+  });
+
+  it("rejects bad max_clicks values", async () => {
+    const e = env();
+    for (const bad of [0, -3, 1.5, "abc", 1000001]) {
+      const r = await createLink(e, null, { url: "https://example.com", max_clicks: bad });
+      expect(r.status).toBe(400);
+    }
   });
 });

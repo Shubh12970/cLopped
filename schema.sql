@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS links (
   long_url TEXT NOT NULL,
   created_at TEXT NOT NULL,
   expires_at TEXT
+  -- Later migrations add: owner_id TEXT (0003), max_clicks INTEGER (0005),
+  -- plus the create_events table (0004, see below). Fresh setups should run
+  -- the migrations after this file.
 );
 
 CREATE TABLE IF NOT EXISTS clicks (

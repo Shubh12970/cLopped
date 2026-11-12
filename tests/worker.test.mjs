@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { toBase62, randomCode, validateLongUrl, validateCustomCode, validateExpiry } from "../worker/index.js";
+import { toBase62, randomCode, validateLongUrl, validateCustomCode, validateExpiry, validateMaxClicks } from "../worker/index.js";
 
 describe("toBase62", () => {
   it("encodes 0", () => expect(toBase62(0)).toBe("0"));
@@ -60,5 +60,20 @@ describe("randomCode (unguessable short codes)", () => {
     const seen = new Set();
     for (let i = 0; i < 500; i++) seen.add(randomCode());
     expect(seen.size).toBe(500);
+  });
+});
+
+describe("validateMaxClicks", () => {
+  it("accepts empty and whole numbers in range", () => {
+    expect(validateMaxClicks(undefined).max_clicks).toBeNull();
+    expect(validateMaxClicks("").max_clicks).toBeNull();
+    expect(validateMaxClicks(1).max_clicks).toBe(1);
+    expect(validateMaxClicks("250").max_clicks).toBe(250);
+    expect(validateMaxClicks(1000000).max_clicks).toBe(1000000);
+  });
+  it("rejects zero, negatives, fractions, non-numbers and huge values", () => {
+    for (const bad of [0, -1, 2.5, "abc", 1000001, NaN]) {
+      expect(validateMaxClicks(bad).error).toBeTruthy();
+    }
   });
 });

@@ -53,6 +53,7 @@ function ShortenForm({ onCreated }) {
   const [url, setUrl] = useState("");
   const [customCode, setCustomCode] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
+  const [maxClicks, setMaxClicks] = useState("");
   const [busy, setBusy] = useState(false);
   const [unguessable, setUnguessable] = useState(false);
   const [error, setError] = useState("");
@@ -71,6 +72,7 @@ function ShortenForm({ onCreated }) {
           url,
           custom_code: customCode || undefined,
           expires_at: expiresAt || undefined,
+          max_clicks: maxClicks ? Number(maxClicks) : undefined,
           code_style: unguessable && !customCode ? "random" : undefined,
         }),
       });
@@ -117,6 +119,17 @@ function ShortenForm({ onCreated }) {
             title="Optional expiry date - the link stops working at 00:00 UTC on this date"
             min={new Date(Date.now() + 86400000).toISOString().slice(0, 10)}
           />
+          <input
+            type="number"
+            min="1"
+            max="1000000"
+            step="1"
+            placeholder="Max clicks (optional)"
+            value={maxClicks}
+            onChange={(e) => setMaxClicks(e.target.value)}
+            title="Optional click limit - the link ends (stops redirecting) after this many clicks"
+            style={{ width: "10rem" }}
+          />
           <button className="btn primary" type="submit" disabled={busy}>
             {busy ? "Shortening..." : "Shorten"}
           </button>
@@ -133,7 +146,7 @@ function ShortenForm({ onCreated }) {
         walking sequential numbers (ignored when a custom code is set)
       </label>
       {error && <p className="error">{error}</p>}
-      <p className="muted">Expiry dates are UTC: a link expires at 00:00 UTC on the chosen date.</p>
+      <p className="muted">Expiry dates are UTC: a link expires at 00:00 UTC on the chosen date. With a click limit, the link ends after that many clicks (the count is approximate, so the end can be off by a few).</p>
       {created && (
         <div className="created">
           <a href={created.short_url} target="_blank" rel="noreferrer">
@@ -223,6 +236,9 @@ function Stats({ code, onClose }) {
       <p className="muted long-url">{stats.long_url}</p>
       {stats.expires_at && (
         <p className="muted">Expires {new Date(stats.expires_at).toUTCString()}</p>
+      )}
+      {stats.max_clicks != null && (
+        <p className="muted">Ends after {stats.max_clicks} clicks{stats.total_clicks >= stats.max_clicks ? " (ended)" : ""}</p>
       )}
       <p><strong>{stats.total_clicks}</strong> total clicks</p>
       {days.length > 0 ? (
@@ -382,6 +398,9 @@ export default function App() {
               <span className="muted long-url">{l.long_url}</span>
               {l.expires_at && (
                 <span className="muted"> - expires {new Date(l.expires_at).toUTCString()}</span>
+              )}
+              {l.max_clicks != null && (
+                <span className="muted"> - ends after {l.max_clicks} clicks</span>
               )}
             </div>
             <div className="row">

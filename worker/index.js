@@ -2,7 +2,7 @@
 //
 // Routes:
 //   POST /api/links                 { url, custom_code?, expires_at? } -> 201 { code, short_url, long_url }
-//   GET  /api/links/:code/stats     -> { code, long_url, created_at, expires_at, total_clicks, by_day, recent }
+//   GET  /api/links/:code/stats     -> { code, long_url, created_at, expires_at, max_clicks, total_clicks, by_day, by_hour, by_referrer, by_country, recent }
 //   GET  /:code                     -> 302 Location: long_url (the hot path: cache, lookup, log click, redirect)
 //                                     410 if the link has expired, 404 if it never existed
 //
@@ -115,6 +115,20 @@ export function validateExpiry(raw) {
   return { expires_at: new Date(t).toISOString() };
 }
 
+// Optional click-count limit: after this many recorded clicks the link
+// "ends" (a friendly 410 page) instead of redirecting. Counted from the
+// clicks table - the same source the stats use - so a burst of simultaneous
+// visitors may get a couple of extra redirects through before the count
+// catches up (clicks were always approximate; the end is approximate too).
+export function validateMaxClicks(raw) {
+  if (raw === undefined || raw === null || raw === "") return { max_clicks: null };
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 1000000) {
+    return { error: "Max clicks must be a whole number between 1 and 1,000,000." };
+  }
+  return { max_clicks: n };
+}
+
 // ---- Auth (stage 2): Clerk session verification ----
 //
 // Owner accounts use Clerk (same provider as the StudyFlow dashboard).
@@ -221,8 +235,10 @@ async function createLink(request, env) {
   if (check.error) return json({ error: check.error }, 400);
   const expiry = validateExpiry(body.expires_at);
   if (expiry.error) return json({ error: expiry.error }, 400);
+  const clicksCap = validateMaxClicks(body.max_clicks);
+  if (clicksCap.error) return json({ error: clicksCap.error }, 400);
 
-  const insert = "INSERT INTO links (code, long_url, created_at, expires_at, owner_id) VALUES (?, ?, ?, ?, ?)";
+  const insert = "INSERT INTO links (code, long_url, created_at, expires_at, owner_id, max_clicks) VALUES (?, ?, ?, ?, ?, ?)";
   const custom = typeof body.custom_code === "string" ? body.custom_code.trim() : "";
   if (custom) {
     const codeErr = validateCustomCode(custom);
@@ -234,11 +250,11 @@ async function createLink(request, env) {
     // catch the constraint violation and answer 409 the same way.
     try {
       await env.DB.prepare(insert)
-        .bind(custom, check.url, new Date().toISOString(), expiry.expires_at, ownerId).run();
+        .bind(custom, check.url, new Date().toISOString(), expiry.expires_at, ownerId, clicksCap.max_clicks).run();
     } catch {
       return json({ error: `The code "${custom}" is already taken.` }, 409);
     }
-    return json({ code: custom, long_url: check.url, short_url: `https://${ownHost}/${custom}`, expires_at: expiry.expires_at, owned: Boolean(ownerId) }, 201);
+    return json({ code: custom, long_url: check.url, short_url: `https://${ownHost}/${custom}`, expires_at: expiry.expires_at, max_clicks: clicksCap.max_clicks, owned: Boolean(ownerId) }, 201);
   }
 
   // Unguessable code (opt-in): random string, retry on the rare collision.
@@ -247,8 +263,8 @@ async function createLink(request, env) {
       const code = randomCode();
       try {
         await env.DB.prepare(insert)
-          .bind(code, check.url, new Date().toISOString(), expiry.expires_at, ownerId).run();
-        return json({ code, long_url: check.url, short_url: `https://${ownHost}/${code}`, expires_at: expiry.expires_at, owned: Boolean(ownerId) }, 201);
+          .bind(code, check.url, new Date().toISOString(), expiry.expires_at, ownerId, clicksCap.max_clicks).run();
+        return json({ code, long_url: check.url, short_url: `https://${ownHost}/${code}`, expires_at: expiry.expires_at, max_clicks: clicksCap.max_clicks, owned: Boolean(ownerId) }, 201);
       } catch { /* UNIQUE collision: draw again */ }
     }
     return json({ error: "Could not allocate a code, please try again." }, 500);
@@ -260,12 +276,12 @@ async function createLink(request, env) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const placeholder = "~" + crypto.randomUUID();
     await env.DB.prepare(insert)
-      .bind(placeholder, check.url, new Date().toISOString(), expiry.expires_at, ownerId).run();
+      .bind(placeholder, check.url, new Date().toISOString(), expiry.expires_at, ownerId, clicksCap.max_clicks).run();
     const row = await env.DB.prepare("SELECT id FROM links WHERE code = ?").bind(placeholder).first();
     const code = toBase62(row.id);
     try {
       await env.DB.prepare("UPDATE links SET code = ? WHERE id = ?").bind(code, row.id).run();
-      return json({ code, long_url: check.url, short_url: `https://${ownHost}/${code}`, expires_at: expiry.expires_at, owned: Boolean(ownerId) }, 201);
+      return json({ code, long_url: check.url, short_url: `https://${ownHost}/${code}`, expires_at: expiry.expires_at, max_clicks: clicksCap.max_clicks, owned: Boolean(ownerId) }, 201);
     } catch {
       await env.DB.prepare("DELETE FROM links WHERE id = ?").bind(row.id).run();
     }
@@ -277,7 +293,7 @@ async function createLink(request, env) {
 // redirect itself is public either way (a short link is meant to be shared),
 // but click analytics belong to the owner.
 async function getStats(request, env, code) {
-  const link = await env.DB.prepare("SELECT code, long_url, created_at, expires_at, owner_id FROM links WHERE code = ?").bind(code).first();
+  const link = await env.DB.prepare("SELECT code, long_url, created_at, expires_at, max_clicks, owner_id FROM links WHERE code = ?").bind(code).first();
   if (!link) return json({ error: "No link with that code." }, 404);
   if (link.owner_id) {
     const userId = await verifySessionUser(request, env);
@@ -347,7 +363,7 @@ async function listMine(request, env) {
   const userId = await verifySessionUser(request, env);
   if (!userId) return json({ error: "Sign in to see your links." }, 401);
   const rows = await env.DB.prepare(
-    `SELECT code, long_url, created_at, expires_at,
+    `SELECT code, long_url, created_at, expires_at, max_clicks,
             (SELECT COUNT(*) FROM clicks WHERE link_code = links.code) AS total_clicks
      FROM links WHERE owner_id = ? ORDER BY id DESC LIMIT 200`
   ).bind(userId).all();
@@ -395,15 +411,22 @@ async function redirect(request, env, ctx, code) {
   let cacheable = Boolean(cached);
 
   if (!longUrl) {
-    const row = await env.DB.prepare("SELECT long_url, expires_at FROM links WHERE code = ?").bind(code).first();
+    const row = await env.DB.prepare("SELECT long_url, expires_at, max_clicks FROM links WHERE code = ?").bind(code).first();
     if (!row) return redirectPage("No short link with that code.", 404);
     if (row.expires_at && Date.parse(row.expires_at) <= Date.now()) {
       return redirectPage("This short link has expired.", 410);
     }
+    if (row.max_clicks != null) {
+      const used = await env.DB.prepare("SELECT COUNT(*) AS n FROM clicks WHERE link_code = ?").bind(code).first();
+      if ((used?.n || 0) >= row.max_clicks) {
+        // Visits past the end are not logged as clicks: they never redirected.
+        return redirectPage("This short link has ended - it reached its click limit.", 410);
+      }
+    }
     longUrl = row.long_url;
-    // Links with an expiry are not edge-cached: a cached 302 could outlive
-    // the link's own expiry by up to the cache TTL.
-    cacheable = !row.expires_at;
+    // Links with an expiry or click limit are not edge-cached: a cached 302
+    // could outlive the link's own end by up to the cache TTL.
+    cacheable = !row.expires_at && row.max_clicks == null;
   }
 
   ctx.waitUntil(
