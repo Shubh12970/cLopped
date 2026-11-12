@@ -115,11 +115,10 @@ export function validateExpiry(raw) {
   return { expires_at: new Date(t).toISOString() };
 }
 
-// Optional click-count limit: after this many recorded clicks the link
-// "ends" (a friendly 410 page) instead of redirecting. Counted from the
-// clicks table - the same source the stats use - so a burst of simultaneous
-// visitors may get a couple of extra redirects through before the count
-// catches up (clicks were always approximate; the end is approximate too).
+// Optional click-count limit: after this many redirects the link "ends" (a
+// friendly 410 page). Enforced by an atomic counter (clicks_used) so the
+// limit is exact even under simultaneous visitors; the clicks table stays
+// the analytics source and can lag the gate by a moment.
 export function validateMaxClicks(raw) {
   if (raw === undefined || raw === null || raw === "") return { max_clicks: null };
   const n = Number(raw);
@@ -161,12 +160,29 @@ function b64urlDecode(s) {
   return Uint8Array.from(b, (c) => c.charCodeAt(0));
 }
 
-// Returns the Clerk user id (sub) for a valid session token, else null.
-export async function verifySessionUser(request, env) {
-  if (!env.CLERK_JWKS_URL || !env.CLERK_ISSUER) return null;
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Returns the user id for a valid credential, else null. Two kinds:
+// a Clerk session JWT (from the signed-in site), or a personal API token
+// ("us_...") created in the account area for scripting. Token lookup uses
+// the SHA-256 hash; the raw token is only ever shown once, at creation.
+export async function verifySessionUser(request, env, ctx) {
   const header = request.headers.get("authorization") || "";
   if (!header.startsWith("Bearer ")) return null;
   const token = header.slice(7);
+  if (token.startsWith("us_") && env.DB) {
+    const row = await env.DB.prepare("SELECT owner_id FROM api_tokens WHERE token_hash = ?")
+      .bind(await sha256Hex(token)).first();
+    if (row && ctx) {
+      ctx.waitUntil(env.DB.prepare("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?")
+        .bind(new Date().toISOString(), await sha256Hex(token)).run());
+    }
+    return row ? row.owner_id : null;
+  }
+  if (!env.CLERK_JWKS_URL || !env.CLERK_ISSUER) return null;
   try {
     const [h, p, sig] = token.split(".");
     const payload = JSON.parse(new TextDecoder().decode(b64urlDecode(p)));
@@ -219,7 +235,7 @@ async function checkRateLimit(request, env) {
   return (row?.n || 0) <= CREATE_LIMIT_PER_HOUR;
 }
 
-async function createLink(request, env) {
+async function createLink(request, env, ctx) {
   let body;
   try {
     body = await request.json();
@@ -229,7 +245,7 @@ async function createLink(request, env) {
   if (!(await checkRateLimit(request, env))) {
     return json({ error: "Rate limit: at most 30 links per rolling 60 minutes from your network. Try again soon." }, 429);
   }
-  const ownerId = await verifySessionUser(request, env);
+  const ownerId = await verifySessionUser(request, env, ctx);
   const ownHost = new URL(request.url).hostname;
   const check = validateLongUrl(String(body.url || "").trim(), ownHost);
   if (check.error) return json({ error: check.error }, 400);
@@ -417,9 +433,14 @@ async function redirect(request, env, ctx, code) {
       return redirectPage("This short link has expired.", 410);
     }
     if (row.max_clicks != null) {
-      const used = await env.DB.prepare("SELECT COUNT(*) AS n FROM clicks WHERE link_code = ?").bind(code).first();
-      if ((used?.n || 0) >= row.max_clicks) {
-        // Visits past the end are not logged as clicks: they never redirected.
+      // Atomic gate: the increment and the limit check are one statement,
+      // so N parallel visitors can never produce more than max_clicks
+      // redirects. No row returned means the limit is already reached.
+      // Visits past the end are not logged as clicks: they never redirected.
+      const gate = await env.DB.prepare(
+        "UPDATE links SET clicks_used = clicks_used + 1 WHERE code = ? AND clicks_used < max_clicks RETURNING clicks_used"
+      ).bind(code).first();
+      if (!gate) {
         return redirectPage("This short link has ended - it reached its click limit.", 410);
       }
     }
@@ -447,7 +468,11 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    if (request.method === "POST" && path === "/api/links") return createLink(request, env);
+    if (request.method === "POST" && path === "/api/links") return createLink(request, env, ctx);
+    if (request.method === "POST" && path === "/api/tokens") return createToken(request, env);
+    if (request.method === "GET" && path === "/api/tokens") return listTokens(request, env);
+    const tokenMatch = path.match(/^\/api\/tokens\/(\d+)$/);
+    if (request.method === "DELETE" && tokenMatch) return deleteToken(request, env, Number(tokenMatch[1]));
     if (request.method === "GET" && path === "/api/links/mine") return listMine(request, env);
     const statsMatch = path.match(/^\/api\/links\/([0-9A-Za-z_-]{1,32})\/stats$/);
     if (request.method === "GET" && statsMatch) return getStats(request, env, statsMatch[1]);

@@ -142,6 +142,12 @@ function fakeDb() {
           total_clicks: clicks.filter((c) => c.link_code === l.code).length }))
         .reverse() } };
     }
+    if (sql.startsWith("UPDATE links SET clicks_used = clicks_used + 1")) {
+      const l = links.find((x) => x.code === args[0]);
+      if (!l || (l.clicks_used || 0) >= l.max_clicks) return { first: null };
+      l.clicks_used = (l.clicks_used || 0) + 1;
+      return { first: { clicks_used: l.clicks_used } };
+    }
     if (sql.startsWith("INSERT INTO clicks")) {
       clicks.push({ id: clicks.length + 1, link_code: args[0], clicked_at: args[1], referrer: args[2], country: args[3] });
       return { run: true };
@@ -387,6 +393,17 @@ describe("click-count limit (max_clicks)", () => {
     const plain = await createLink(e, null, { url: "https://example.com/b" });
     await hit(e, plain.data.code);
     expect(cachePuts).toEqual([`https://short.dev/${plain.data.code}`]);
+  });
+
+  it("parallel visitors cannot exceed the limit (atomic gate)", async () => {
+    const e = env();
+    const c = await createLink(e, null, { url: "https://example.com", max_clicks: 2 });
+    expect(c.status).toBe(201);
+    const results = await Promise.all(Array.from({ length: 10 }, () => hit(e, c.data.code)));
+    const redirects = results.filter((r) => r.status === 302).length;
+    const ended = results.filter((r) => r.status === 410).length;
+    expect(redirects).toBe(2);
+    expect(ended).toBe(8);
   });
 
   it("visits past the end are not logged as clicks", async () => {
