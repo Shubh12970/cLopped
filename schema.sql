@@ -30,6 +30,8 @@ CREATE INDEX IF NOT EXISTS idx_clicks_link ON clicks(link_code, clicked_at);
 -- Abuse control: fixed 1-hour window per client IP for link creation.
 -- (A fixed window can burst 2x at a boundary; a sliding window or token
 -- bucket is the interview upgrade.)
+-- Superseded by create_events (migration 0004); kept so fresh setups match
+-- the migrated live database shape.
 CREATE TABLE IF NOT EXISTS rate_limits (
   ip TEXT NOT NULL,
   window_start TEXT NOT NULL,
@@ -41,3 +43,12 @@ CREATE TABLE IF NOT EXISTS rate_limits (
 -- Codes stay >= 3 chars and grow as rows are added; custom codes are checked
 -- against existing rows.
 INSERT OR IGNORE INTO sqlite_sequence (name, seq) VALUES ('links', 3843);
+
+-- Rolling 60-minute create-rate log (migration 0004). Rows older than a day
+-- are pruned by the worker on each create.
+CREATE TABLE IF NOT EXISTS create_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_create_events_ip_time ON create_events (ip, created_at);

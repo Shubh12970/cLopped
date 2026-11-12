@@ -175,27 +175,34 @@ export async function verifySessionUser(request, env) {
   }
 }
 
-// Fixed-window per-IP rate limit on creation (30/hour): shorteners get
-// abused to hide malicious links, and an open create endpoint needs a brake.
-// A fixed window can burst 2x at a boundary; the interview upgrade is a
-// sliding window or token bucket (the sibling project).
+// Sliding-window per-IP rate limit on creation (30 per trailing 60 min):
+// shorteners get abused to hide malicious links, and an open create endpoint
+// needs a brake. This is an exact rolling log: every create attempt writes a
+// row to create_events, and the check counts that IP's rows in the trailing
+// 60 minutes. Unlike a fixed clock-hour window it cannot burst 2x at an
+// hour boundary - the window always looks back 60 real minutes.
+// Two honest trade-offs: a rejected attempt still counts toward the window
+// (standard limiter behavior; it keeps an abuser limited), and two creates
+// that land in the same instant can both be rejected at the limit's edge
+// (rare, and failing safe). A cheaper alternative is the weighted two-window
+// estimate the sibling rate-limiter project teaches; we chose exactness.
 const CREATE_LIMIT_PER_HOUR = 30;
-
-export function hourWindowStart(now = Date.now()) {
-  return new Date(Math.floor(now / 3600000) * 3600000).toISOString();
-}
+const WINDOW_MS = 60 * 60 * 1000;
 
 async function checkRateLimit(request, env) {
   const ip = request.headers.get("cf-connecting-ip") || "unknown";
-  const windowStart = hourWindowStart();
-  const row = await env.DB.prepare("SELECT count FROM rate_limits WHERE ip = ? AND window_start = ?")
-    .bind(ip, windowStart).first();
-  if (row && row.count >= CREATE_LIMIT_PER_HOUR) return false;
-  await env.DB.prepare(
-    `INSERT INTO rate_limits (ip, window_start, count) VALUES (?, ?, 1)
-     ON CONFLICT(ip, window_start) DO UPDATE SET count = count + 1`
-  ).bind(ip, windowStart).run();
-  return true;
+  const now = new Date();
+  await env.DB.prepare("INSERT INTO create_events (ip, created_at) VALUES (?, ?)")
+    .bind(ip, now.toISOString()).run();
+  const since = new Date(now.getTime() - WINDOW_MS).toISOString();
+  // ISO-8601 UTC strings sort lexicographically, so >= works on text.
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM create_events WHERE ip = ? AND created_at >= ?"
+  ).bind(ip, since).first();
+  // Keep the log bounded: rows older than a day can never matter again.
+  const dayAgo = new Date(now.getTime() - 24 * WINDOW_MS).toISOString();
+  await env.DB.prepare("DELETE FROM create_events WHERE created_at < ?").bind(dayAgo).run();
+  return (row?.n || 0) <= CREATE_LIMIT_PER_HOUR;
 }
 
 async function createLink(request, env) {
@@ -206,7 +213,7 @@ async function createLink(request, env) {
     return json({ error: "Expected a JSON body like { \"url\": \"https://...\" }." }, 400);
   }
   if (!(await checkRateLimit(request, env))) {
-    return json({ error: "Rate limit: too many links created from your network. Try again in a bit." }, 429);
+    return json({ error: "Rate limit: at most 30 links per rolling 60 minutes from your network. Try again soon." }, 429);
   }
   const ownerId = await verifySessionUser(request, env);
   const ownHost = new URL(request.url).hostname;

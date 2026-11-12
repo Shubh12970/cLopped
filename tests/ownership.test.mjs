@@ -41,18 +41,21 @@ async function makeToken(sub, { iss = ISSUER, kid = "test-key-1", key = privateK
 function fakeDb() {
   const links = [];
   const clicks = [];
-  const rate = new Map();
+  const createEvents = [];
   let nextId = 1;
   const route = (sql, args) => {
     sql = sql.replace(/\s+/g, " ").trim();
     let m;
-    if ((m = sql.match(/^SELECT count FROM rate_limits WHERE ip = \? AND window_start = \?$/))) {
-      const n = rate.get(`${args[0]}|${args[1]}`) || 0;
-      return { first: n ? { count: n } : null };
+    if (sql.startsWith("INSERT INTO create_events")) {
+      createEvents.push({ ip: args[0], created_at: args[1] });
+      return { run: true };
     }
-    if (sql.startsWith("INSERT INTO rate_limits")) {
-      const k = `${args[0]}|${args[1]}`;
-      rate.set(k, (rate.get(k) || 0) + 1);
+    if ((m = sql.match(/^SELECT COUNT\(\*\) AS n FROM create_events WHERE ip = \? AND created_at >= \?$/))) {
+      const n = createEvents.filter((e) => e.ip === args[0] && e.created_at >= args[1]).length;
+      return { first: { n } };
+    }
+    if (sql.startsWith("DELETE FROM create_events")) {
+      for (let i = createEvents.length - 1; i >= 0; i--) if (createEvents[i].created_at < args[0]) createEvents.splice(i, 1);
       return { run: true };
     }
     if (sql.startsWith("INSERT INTO links")) {
@@ -159,6 +162,7 @@ function fakeDb() {
       };
     },
     _links: links,
+    _createEvents: createEvents,
   };
 }
 
@@ -324,5 +328,37 @@ describe("analytics breakdowns and CSV export (milestone: option 1)", () => {
     expect((await csv(null)).status).toBe(403);
     expect((await csv(await makeToken("user_b"))).status).toBe(403);
     expect((await csv(owner)).status).toBe(200);
+  });
+});
+
+describe("sliding-window create rate limit", () => {
+  const createFrom = (env, ip, i) =>
+    worker.fetch(new Request("https://short.dev/api/links", {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": ip },
+      body: JSON.stringify({ url: `https://example.com/${i}` }),
+    }), env, ctx);
+
+  it("allows 30 creates in the trailing 60 minutes and rejects the 31st", async () => {
+    const e = env();
+    for (let i = 0; i < 30; i++) expect((await createFrom(e, "9.9.9.9", i)).status).toBe(201);
+    const r31 = await createFrom(e, "9.9.9.9", 31);
+    expect(r31.status).toBe(429);
+    expect((await r31.json()).error).toContain("60 minutes");
+  });
+
+  it("attempts older than 60 minutes stop counting (no clock-hour boundary)", async () => {
+    const e = env();
+    const old = new Date(Date.now() - 61 * 60 * 1000).toISOString();
+    for (let i = 0; i < 30; i++) e.DB._createEvents.push({ ip: "9.9.9.8", created_at: old });
+    expect((await createFrom(e, "9.9.9.8", "old-ok")).status).toBe(201);
+  });
+
+  it("a limited IP does not affect other IPs", async () => {
+    const e = env();
+    const now = new Date().toISOString();
+    for (let i = 0; i < 30; i++) e.DB._createEvents.push({ ip: "9.9.9.7", created_at: now });
+    expect((await createFrom(e, "9.9.9.7", "blocked")).status).toBe(429);
+    expect((await createFrom(e, "9.9.9.6", "fine")).status).toBe(201);
   });
 });
