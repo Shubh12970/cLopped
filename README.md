@@ -1,4 +1,4 @@
-# snip - URL shortener
+# URL shortener
 
 A TinyURL-style URL shortener built as a system-design learning project.
 Paste a long URL, get a short link; visiting it returns a 302 redirect while
