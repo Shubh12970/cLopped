@@ -248,7 +248,21 @@ async function createLink(request, env, ctx) {
   if (!(await checkRateLimit(request, env))) {
     return json({ error: "Rate limit: at most 30 links per rolling 60 minutes from your network. Try again soon." }, 429);
   }
-  const ownerId = await verifySessionUser(request, env, ctx);
+  // Anonymous creation is for requests with NO credentials. If a bearer
+  // credential is supplied but does not verify (expired Clerk session,
+  // revoked or wrong API token), refuse instead of silently creating a
+  // public anonymous link the caller believes is theirs.
+  let ownerId = null;
+  const authHeader = request.headers.get("authorization") || "";
+  if (authHeader) {
+    if (!authHeader.startsWith("Bearer ")) {
+      return json({ error: "Use Authorization: Bearer <token>." }, 401);
+    }
+    ownerId = await verifySessionUser(request, env, ctx);
+    if (!ownerId) {
+      return json({ error: "That sign-in or API token is not valid (anymore). Sign in again or mint a new token." }, 401);
+    }
+  }
   const ownHost = new URL(request.url).hostname;
   const check = validateLongUrl(String(body.url || "").trim(), ownHost);
   if (check.error) return json({ error: check.error }, 400);

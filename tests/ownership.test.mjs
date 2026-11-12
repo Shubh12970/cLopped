@@ -306,19 +306,19 @@ describe("ownership", () => {
     expect(anon.status).toBe(401);
   });
 
-  it("a tampered or wrong-issuer token is treated as anonymous", async () => {
+  it("a tampered, wrong-issuer or expired token is rejected 401", async () => {
     const e = env();
     const badIss = await makeToken("user_a", { iss: "https://evil.example" });
     const r1 = await createLink(e, badIss, { url: "https://example.com" });
-    expect(r1.data.owned).toBe(false);
+    expect(r1.status).toBe(401);
     const otherKey = (await crypto.subtle.generateKey(
       { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign"])).privateKey;
     const forged = await makeToken("user_a", { key: otherKey });
     const r2 = await createLink(e, forged, { url: "https://example.com" });
-    expect(r2.data.owned).toBe(false);
+    expect(r2.status).toBe(401);
     const expired = await makeToken("user_a", { exp: Math.floor(Date.now() / 1000) - 10 });
     const r3 = await createLink(e, expired, { url: "https://example.com" });
-    expect(r3.data.owned).toBe(false);
+    expect(r3.status).toBe(401);
   });
 });
 
@@ -489,11 +489,25 @@ describe("personal API tokens", () => {
     expect(viaToken.status).toBe(200);
   });
 
-  it("an unknown token does not authenticate (create falls back to anonymous)", async () => {
+  it("an explicitly supplied but invalid credential is rejected 401 (no silent anonymous downgrade)", async () => {
     const e = env();
-    const r = await createLink(e, "us_" + "0".repeat(48), { url: "https://example.com" });
+    for (const bad of ["us_" + "0".repeat(48), "not-a-real-jwt", "Bearer-without-scheme"]) {
+      const r = await createLink(e, bad, { url: "https://example.com" });
+      expect(r.status).toBe(401);
+    }
+    expect(e.DB._links.length).toBe(0);
+  });
+
+  it("a valid API token works even without Clerk configured (token auth is independent)", async () => {
+    const e = env();
+    const session = await makeToken("user_a");
+    const m = await mint(e, session);
+    const bare = { DB: e.DB }; // no CLERK_JWKS_URL / CLERK_ISSUER
+    const r = await createLink(bare, m.data.token, { url: "https://example.com" });
     expect(r.status).toBe(201);
-    expect(r.data.owned).toBe(false);
+    expect(r.data.owned).toBe(true);
+    const bad = await createLink(bare, "us_" + "1".repeat(48), { url: "https://example.com" });
+    expect(bad.status).toBe(401);
   });
 
   it("lists tokens without the raw token, scoped to the owner", async () => {
@@ -523,6 +537,7 @@ describe("personal API tokens", () => {
     expect((await del(a, 9999)).status).toBe(404);
     expect((await del(a, m.data.id)).status).toBe(204);
     const r = await createLink(e, m.data.token, { url: "https://example.com" });
-    expect(r.data.owned).toBe(false);
+    expect(r.status).toBe(401);
+    expect(e.DB._links.length).toBe(0);
   });
 });
