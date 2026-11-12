@@ -104,6 +104,14 @@ function fakeDb() {
     if (sql.startsWith("SELECT COUNT(*) AS n FROM clicks")) {
       return { first: { n: clicks.filter((c) => c.link_code === args[0]).length } };
     }
+    if (sql.startsWith("SELECT substr(clicked_at, 12, 2)")) {
+      const byHour = {};
+      for (const c of clicks.filter((x) => x.link_code === args[0])) {
+        const h = c.clicked_at.slice(11, 13);
+        byHour[h] = (byHour[h] || 0) + 1;
+      }
+      return { all: { results: Object.entries(byHour).map(([hour, n]) => ({ hour, clicks: n })) } };
+    }
     if (sql.startsWith("SELECT substr(clicked_at")) {
       const byDay = {};
       for (const c of clicks.filter((x) => x.link_code === args[0])) {
@@ -111,6 +119,16 @@ function fakeDb() {
         byDay[d] = (byDay[d] || 0) + 1;
       }
       return { all: { results: Object.entries(byDay).map(([day, n]) => ({ day, clicks: n })) } };
+    }
+    if (sql.startsWith("SELECT referrer, COUNT(*) AS clicks FROM clicks")) {
+      const m = {};
+      for (const c of clicks.filter((x) => x.link_code === args[0])) m[c.referrer] = (m[c.referrer] || 0) + 1;
+      return { all: { results: Object.entries(m).map(([referrer, n]) => ({ referrer, clicks: n })) } };
+    }
+    if (sql.startsWith("SELECT country, COUNT(*) AS clicks FROM clicks")) {
+      const m = {};
+      for (const c of clicks.filter((x) => x.link_code === args[0])) m[c.country] = (m[c.country] || 0) + 1;
+      return { all: { results: Object.entries(m).map(([country, n]) => ({ country, clicks: n })) } };
     }
     if (sql.startsWith("SELECT clicked_at, referrer, country")) {
       return { all: { results: clicks.filter((c) => c.link_code === args[0]).slice(-20).reverse() } };
@@ -258,5 +276,53 @@ describe("ownership", () => {
     const expired = await makeToken("user_a", { exp: Math.floor(Date.now() / 1000) - 10 });
     const r3 = await createLink(e, expired, { url: "https://example.com" });
     expect(r3.data.owned).toBe(false);
+  });
+});
+
+describe("analytics breakdowns and CSV export (milestone: option 1)", () => {
+  it("stats include host-level referrer and country breakdowns", async () => {
+    const e = env();
+    const r = await createLink(e, null, { url: "https://example.com" });
+    const code = r.data.code;
+    const click = (ref) => worker.fetch(new Request(`https://short.dev/${code}`,
+      { headers: ref ? { referer: ref } : {} }), e, ctx);
+    await click("https://x.com/post/1");
+    await click("https://x.com/post/2");
+    await click("https://instagram.com/p/abc");
+    await click(null); // direct
+    const res = await worker.fetch(new Request(`https://short.dev/api/links/${code}/stats`), e, ctx);
+    const s = await res.json();
+    expect(res.status).toBe(200);
+    expect(s.by_referrer).toEqual([
+      { label: "x.com", clicks: 2 },
+      { label: "direct", clicks: 1 },
+      { label: "instagram.com", clicks: 1 },
+    ]);
+    expect(s.by_country).toEqual([{ label: "unknown", clicks: 4 }]); // no cf country in tests
+  });
+
+  it("CSV download serves raw clicks for an anonymous link", async () => {
+    const e = env();
+    const r = await createLink(e, null, { url: "https://example.com" });
+    const code = r.data.code;
+    await worker.fetch(new Request(`https://short.dev/${code}`,
+      { headers: { referer: "https://x.com/a" } }), e, ctx);
+    const res = await worker.fetch(new Request(`https://short.dev/api/links/${code}/clicks.csv`), e, ctx);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/text\/csv/);
+    const body = await res.text();
+    expect(body.split("\n")[0]).toBe("clicked_at,referrer,country");
+    expect(body).toContain("https://x.com/a");
+  });
+
+  it("CSV for an owned link is private to the owner", async () => {
+    const e = env();
+    const owner = await makeToken("user_a");
+    const r = await createLink(e, owner, { url: "https://example.com" });
+    const csv = (t) => worker.fetch(new Request(`https://short.dev/api/links/${r.data.code}/clicks.csv`,
+      t ? authed(t) : {}), e, ctx);
+    expect((await csv(null)).status).toBe(403);
+    expect((await csv(await makeToken("user_b"))).status).toBe(403);
+    expect((await csv(owner)).status).toBe(200);
   });
 });

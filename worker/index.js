@@ -47,6 +47,14 @@ export function randomCode(length = RANDOM_CODE_LENGTH) {
   return s;
 }
 
+// Referrers are stored as full URLs; the stats breakdown groups them by
+// host so "https://x.com/post/1" and "https://x.com/post/2" count as one
+// source, x.com. Empty means the visitor came directly.
+export function refererHost(referrer) {
+  if (!referrer) return "direct";
+  try { return new URL(referrer).hostname; } catch { return "other"; }
+}
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -286,8 +294,45 @@ async function getStats(request, env, code) {
     `SELECT clicked_at, referrer, country FROM clicks
      WHERE link_code = ? ORDER BY id DESC LIMIT 20`
   ).bind(code).all();
+  const refRaw = await env.DB.prepare(
+    `SELECT referrer, COUNT(*) AS clicks FROM clicks WHERE link_code = ? GROUP BY referrer ORDER BY clicks DESC LIMIT 100`
+  ).bind(code).all();
+  const refMap = new Map();
+  for (const r of refRaw.results) {
+    const label = refererHost(r.referrer);
+    refMap.set(label, (refMap.get(label) || 0) + r.clicks);
+  }
+  const by_referrer = [...refMap.entries()].map(([label, clicks]) => ({ label, clicks }))
+    .sort((a, b) => b.clicks - a.clicks || a.label.localeCompare(b.label)).slice(0, 10);
+  const countryRaw = await env.DB.prepare(
+    `SELECT country, COUNT(*) AS clicks FROM clicks WHERE link_code = ? GROUP BY country ORDER BY clicks DESC LIMIT 30`
+  ).bind(code).all();
+  const by_country = countryRaw.results.map((r) => ({ label: r.country || "unknown", clicks: r.clicks }));
   const { owner_id, ...rest } = link;
-  return json({ ...rest, owned: Boolean(owner_id), total_clicks: total.n, by_day: byDay.results, by_hour, recent: recent.results });
+  return json({ ...rest, owned: Boolean(owner_id), total_clicks: total.n, by_day: byDay.results, by_hour, by_referrer, by_country, recent: recent.results });
+}
+
+// Raw clicks as a CSV download. Same privacy rule as stats: public for
+// anonymous links, owner-only for owned links. Capped at 5000 rows.
+async function getClicksCsv(request, env, code) {
+  const link = await env.DB.prepare("SELECT owner_id FROM links WHERE code = ?").bind(code).first();
+  if (!link) return json({ error: "No short link with that code." }, 404);
+  if (link.owner_id) {
+    const userId = await verifySessionUser(request, env);
+    if (userId !== link.owner_id) return json({ error: "Stats for this link are private to its owner." }, 403);
+  }
+  const rows = await env.DB.prepare(
+    "SELECT clicked_at, referrer, country FROM clicks WHERE link_code = ? ORDER BY id DESC LIMIT 5000"
+  ).bind(code).all();
+  const esc = (v) => `"${String(v ?? "").replaceAll('"', '""')}"`;
+  const csv = ["clicked_at,referrer,country",
+    ...rows.results.map((r) => `${esc(r.clicked_at)},${esc(r.referrer)},${esc(r.country)}`)].join("\n") + "\n";
+  return new Response(csv, {
+    headers: {
+      "content-type": "text/csv; charset=utf-8",
+      "content-disposition": `attachment; filename="clicks-${code}.csv"`,
+    },
+  });
 }
 
 // The signed-in user's own links, newest first (stage 2).
@@ -376,6 +421,8 @@ export default {
     if (request.method === "GET" && path === "/api/links/mine") return listMine(request, env);
     const statsMatch = path.match(/^\/api\/links\/([0-9A-Za-z_-]{1,32})\/stats$/);
     if (request.method === "GET" && statsMatch) return getStats(request, env, statsMatch[1]);
+    const csvMatch = path.match(/^\/api\/links\/([0-9A-Za-z_-]{1,32})\/clicks\.csv$/);
+    if (request.method === "GET" && csvMatch) return getClicksCsv(request, env, csvMatch[1]);
     const deleteMatch = path.match(/^\/api\/links\/([0-9A-Za-z_-]{1,32})$/);
     if (request.method === "DELETE" && deleteMatch) return deleteLink(request, env, deleteMatch[1]);
 

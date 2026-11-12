@@ -168,6 +168,26 @@ function QrButton({ code }) {
   );
 }
 
+// One ranked breakdown list (referrers or countries) with plain-CSS bars.
+function Breakdown({ title, rows }) {
+  if (!rows || rows.length === 0) return null;
+  const max = Math.max(1, ...rows.map((r) => r.clicks));
+  return (
+    <div className="breakdown">
+      <p className="muted">{title}</p>
+      {rows.map((r) => (
+        <div className="break-row" key={r.label}>
+          <span className="break-label" title={r.label}>{r.label}</span>
+          <div className="break-track">
+            <div className="break-bar" style={{ width: `${(r.clicks / max) * 100}%` }} />
+          </div>
+          <span className="break-count">{r.clicks}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Stats({ code, onClose }) {
   const authedFetch = useAuthedFetch();
   const [stats, setStats] = useState(null);
@@ -176,6 +196,18 @@ function Stats({ code, onClose }) {
       .then((r) => r.json())
       .then(setStats);
   }, [code, authedFetch]);
+
+  // CSV is fetched (not linked) so owned links send the session token too.
+  const downloadCsv = async () => {
+    const r = await authedFetch(`/api/links/${encodeURIComponent(code)}/clicks.csv`);
+    if (!r.ok) return;
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `clicks-${code}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
 
   if (!stats) return <section className="card"><p>Loading stats...</p></section>;
   if (stats.error) return <section className="card"><p className="error">{stats.error}</p></section>;
@@ -224,6 +256,15 @@ function Stats({ code, onClose }) {
             })}
           </div>
         </div>
+      )}
+      {stats.total_clicks > 0 && (
+        <>
+          <Breakdown title="Top referrers (where clicks came from)" rows={stats.by_referrer} />
+          <Breakdown title="Countries (coarse, from Cloudflare)" rows={stats.by_country} />
+          <p>
+            <button className="btn ghost" onClick={downloadCsv}>Download clicks as CSV (up to 5000)</button>
+          </p>
+        </>
       )}
       {stats.recent.length > 0 && (
         <table>

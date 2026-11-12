@@ -135,3 +135,11 @@ footer { text-align: center; font-size: 0.8rem; margin-top: 24px; }
 .heat { display: grid; grid-template-columns: repeat(12, 1fr); gap: 4px; margin-top: 0.4rem; }
 .heat-cell { background: #8f85ff; border-radius: 4px; text-align: center; padding: 0.3rem 0; font-size: 0.65rem; color: #12121a; }
 .heat-cell span { font-weight: 600; }
+
+/* Ranked breakdown lists (top referrers, countries) */
+.breakdown { margin-top: 1rem; }
+.break-row { display: flex; align-items: center; gap: 0.6rem; margin: 0.2rem 0; font-size: 0.85rem; }
+.break-label { flex: 0 0 9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.break-track { flex: 1; background: #2a2a35; border-radius: 4px; height: 10px; overflow: hidden; }
+.break-bar { background: #8f85ff; height: 100%; }
+.break-count { flex: 0 0 2rem; text-align: right; color: #9d9daa; }
