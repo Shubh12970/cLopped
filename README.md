@@ -1,53 +1,90 @@
 # snip - URL shortener
 
-A TinyURL-style URL shortener, built as a system-design learning project.
-Paste a long link, get a short one like `https://<host>/1Bc`; anyone visiting
-it is 302-redirected to the original while the click is logged for analytics.
+A TinyURL-style URL shortener built as a system-design learning project.
+Paste a long URL, get a short link; visiting it returns a 302 redirect while
+an asynchronous click log feeds analytics.
 
 **Live demo:** https://url-shortener.2wf0w2.workers.dev
 
+## Features
+
+- Sequential base62 codes, custom aliases and optional random 8-character codes.
+- Optional date expiry and click-count expiry. Click-count admission uses one
+  conditional SQL update, not a read-then-increment race.
+- Client-side QR generation; best-effort 60-second edge caching for eligible links.
+- Clerk owner accounts, private owned-link stats/CSV, owner-only deletion.
+- Totals, daily/hourly charts, bounded referrer/country breakdowns, CSV export.
+- Revocable personal API tokens, shown once and stored as SHA-256 hashes.
+- Creation limit: 30 attempts per rolling 60 minutes per IP.
+
 ## Stack
 
-| Piece | Choice | Why |
-| --- | --- | --- |
-| Frontend | React + Vite | Same stack as the StudyFlow dashboard; Vite gives a fast dev server and a static build the Worker can serve. |
-| API + redirect | Cloudflare Workers | Free tier, no credit card; runs at the edge so redirects answer in milliseconds. |
-| Database | Cloudflare D1 (SQLite) | Real SQL (the design calls for a links table with an index on `code`); serverless and free. |
-| Short codes | base62 of the sequential row id | Collision-free by construction; no uniqueness-check-and-retry loop like random hashes need. |
-
-No custom web framework on the Worker and no CSS framework: the project is
-small enough that plain `fetch` routing and hand-written CSS keep every line
-understandable - which is the point of a learning build.
+React + Vite, hand-written CSS, Cloudflare Workers, D1 (SQLite), Clerk.
+No Worker web framework or chart library. Free-tier deployment; no credit card
+was used for this build. Provider quotas and policies can change.
 
 ## API
 
-```
-POST /api/links              { "url": "https://...", "custom_code": "optional" }
-                             -> 201 { "code": "1Bc", "short_url": "...", "long_url": "..." }
-GET  /api/links              -> { "links": [{ "code", "long_url", "created_at", "clicks" }] }
-GET  /api/links/:code/stats  -> { "code", "long_url", "total_clicks", "by_day": [...], "recent": [...] }
-GET  /:code                  -> 302 Location: <long_url>   (click logged async)
-```
+| Route | Purpose |
+| --- | --- |
+| `POST /api/links` | Create; URL plus optional `custom_code`, `expires_at`, `max_clicks`, `code_style: "random"` |
+| `GET /:code` | Redirect, or 410 ended/expired, 404 unknown |
+| `GET /api/links/:code/stats` | Stats; owner-only for owned links |
+| `GET /api/links/:code/clicks.csv` | Newest 5000 click rows; same privacy rule |
+| `GET /api/links/mine` | Authenticated owner's links |
+| `DELETE /api/links/:code` | Owner-only deletion |
+| `POST /api/tokens` | Mint a personal token with a valid owner credential |
+| `GET /api/tokens` | Owner's token metadata, never raw secrets |
+| `DELETE /api/tokens/:id` | Revoke an owned token |
+
+Use `Authorization: Bearer <credential>` with a Clerk session JWT or a personal
+API token. Anonymous creation accepts no nonempty credential. An invalid supplied
+credential is rejected with 401, never silently downgraded to anonymous creation.
 
 ## Run locally
 
 ```bash
 npm install
-npm run d1:migrate:local   # create the local D1 tables
-npm run dev                # Vite dev server for the frontend
-npx wrangler dev           # full stack: Worker + local D1 + built assets
+npm run d1:migrate:local
+npm run build
+npx wrangler dev
 ```
 
-## Deploy
+For frontend development, `npm run dev` starts Vite. Clerk environment values
+are public configuration, not passwords; configure your own instance for sign-in.
+
+## Test and deploy
 
 ```bash
-npx wrangler d1 create url_shortener   # once; put the database_id in wrangler.toml
-npm run d1:migrate                     # create the remote tables
+npm test
+npx wrangler d1 create url_shortener  # once; use your database_id in wrangler.toml
+npm run d1:migrate                  # apply remote migrations
 npm run deploy
 ```
 
-## Design notes
+53 automated tests passed on 12 November 2026. The integration tests use a
+purpose-built D1 stub; separate bounded checks exercised the deployed service.
+A live 10-request parallel check at a click limit of 2 returned 2 redirects and
+8 ended pages. This is not a load benchmark or a user-count capacity claim.
 
-The full build documentation (step-by-step decisions, alternatives, testing,
-interview reasoning) lives in the project folder on Google Drive next to this
-code archive.
+## Honest limits
+
+Anonymous stats and CSV are public to anyone with the code. Default sequential
+codes are enumerable. Click analytics can count bots/prefetch and lose failed
+asynchronous writes. The click gate and analytics log can differ. Cached redirects
+may survive deletion at other edge locations until the 60-second TTL expires.
+
+Referrer grouping uses at most 100 raw groups folded to 10 hosts, so some hosts
+can be undercounted. CSV quotes fields but does not neutralize spreadsheet
+formulas: inspect untrusted exports in a text editor or import columns as text.
+Tokens have full owner access, no narrower scopes or automatic expiry. The current
+Clerk instance is a development instance; free-provider and shared-D1 limits
+remain. No lakh-user capacity or universal availability guarantee is claimed.
+
+## Documentation
+
+The beginner-first teaching guide and progress report are mirrored in
+[`docs/documentation.html`](docs/documentation.html) and
+[`docs/progress-report.html`](docs/progress-report.html). Download/open the HTML
+to read it; GitHub's source view does not render it as a web page.
+The originals remain the living Google Docs in the project folder on Drive.
